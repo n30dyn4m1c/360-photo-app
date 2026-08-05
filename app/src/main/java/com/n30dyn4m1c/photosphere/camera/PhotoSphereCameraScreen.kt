@@ -95,7 +95,6 @@ import com.n30dyn4m1c.photosphere.metadata.GPanoMetadata
 import com.n30dyn4m1c.photosphere.sensor.OrientationAccuracy
 import com.n30dyn4m1c.photosphere.sensor.OrientationData
 import com.n30dyn4m1c.photosphere.sensor.currentDisplayRotation
-import com.n30dyn4m1c.photosphere.sensor.meanOrientation
 import com.n30dyn4m1c.photosphere.sensor.rememberOrientationTracker
 import com.n30dyn4m1c.photosphere.stitching.CameraPose
 import com.n30dyn4m1c.photosphere.stitching.PhotoSphereStitcher
@@ -186,10 +185,13 @@ fun PhotoSphereCameraScreen(
     val feedback = rememberCaptureFeedback()
     val deviceProfile = remember { SphereDeviceProfile.forDevice() }
 
-    // Shared between the capture loop and the undo control: both need to reset a
-    // half-completed dwell. Kept at the screen's scope so an undo can reach it
-    // from outside the loop that runs it.
-    val gate = remember { AlignmentGate() }
+    // The capture loop's decision-making, and the single owner of where the run
+    // has got to. Capture, undo and restart all move that position, and they are
+    // not naturally exclusive — a capture suspends for hundreds of milliseconds
+    // while its frame is written — so they are serialised in there rather than
+    // raced against each other from here.
+    val coordinator = remember { SphereCaptureCoordinator() }
+    val guidance by coordinator.guidance.collectAsStateWithLifecycle()
 
     // Which lens CameraX actually bound, and the shape of the buffer it is
     // producing. Both are only knowable once the bind has resolved, and both
@@ -241,10 +243,15 @@ fun PhotoSphereCameraScreen(
     // what the session is holding.
     var captureProfile by remember { mutableStateOf<SphereCaptureProfile?>(null) }
     var boundCamera by remember { mutableStateOf<Camera?>(null) }
-    var plan by remember { mutableStateOf<SphereTargetPlan?>(null) }
-    var activeIndex by remember { mutableIntStateOf(0) }
     var isHolding by remember { mutableStateOf(false) }
     var accuracy by remember { mutableStateOf(OrientationAccuracy.Unknown) }
+
+    // Why the camera did not start, and the counter that asks it to try again.
+    // A bind can fail for reasons that pass — another app holding the camera,
+    // a provider that was not ready — so the failure is a state the user can
+    // act on rather than a dead screen.
+    var cameraError by remember { mutableStateOf<String?>(null) }
+    var bindAttempt by remember { mutableIntStateOf(0) }
 
     // Lens model defaults. The sensor poses + pinhole combination is the
     // reliable core of the stitch; pose refinement can move frames off the
@@ -294,16 +301,23 @@ fun PhotoSphereCameraScreen(
      */
     var alignment by remember { mutableStateOf(AlignmentState()) }
 
+    /** Clears the guidance state so the next sphere starts from scratch. */
+    suspend fun resetGuidance() {
+        coordinator.reset()
+        isHolding = false
+        alignment = AlignmentState()
+    }
+
     // Bind preview + capture once per lifecycle owner. CameraX unbinds on its own
-    // when that lifecycle is destroyed.
-    LaunchedEffect(lifecycleOwner, previewView) {
+    // when that lifecycle is destroyed. Re-keyed on [bindAttempt] so a failed
+    // bind can be retried without leaving and re-entering the screen.
+    LaunchedEffect(lifecycleOwner, previewView, bindAttempt) {
+        cameraError = null
         val cameraProvider = try {
             context.awaitCameraProvider()
         } catch (e: Exception) {
             Log.e(TAG, "Camera provider unavailable", e)
-            snackbarHostState.showSnackbar(
-                context.getString(R.string.capture_failed, e.message.orEmpty())
-            )
+            cameraError = context.getString(R.string.capture_failed, e.message.orEmpty())
             return@LaunchedEffect
         }
 
@@ -405,9 +419,11 @@ fun PhotoSphereCameraScreen(
             Log.i(TAG, "Bound camera $boundCameraId, stills $streamAspectRatio:1")
         } catch (e: Exception) {
             Log.e(TAG, "Camera binding failed", e)
-            snackbarHostState.showSnackbar(
-                context.getString(R.string.capture_failed, e.message.orEmpty())
-            )
+            // Nothing is bound, so there is no viewfinder to put a transient
+            // snackbar over — the failure stays on screen with a way out of it.
+            imageCapture = null
+            boundCamera = null
+            cameraError = context.getString(R.string.capture_failed, e.message.orEmpty())
         }
     }
 
@@ -437,22 +453,12 @@ fun PhotoSphereCameraScreen(
         buffer.pruneStaleSessions()
     }
 
-    // The capture loop. Collecting suspends across the shutter, which is what
-    // keeps a second capture from starting while one is still being written —
-    // the StateFlow simply conflates the samples that arrive meanwhile.
+    // The capture loop's camera half. The rule that decides whether the shutter
+    // fires lives in [SphereCaptureCoordinator]; what is left here is the part
+    // that needs an ImageCapture behind it.
     LaunchedEffect(imageCapture) {
         val capture = imageCapture ?: return@LaunchedEffect
         val profile = captureProfile ?: return@LaunchedEffect
-        // The gate is shared with the undo control, so a fresh camera bind starts
-        // with a clean dwell rather than whatever the previous bind left behind.
-        gate.reset()
-
-        // The pose stamped onto each frame is the mean over a short window of
-        // samples. The gate has just confirmed the aim held still for a dwell,
-        // so the window is all deliberate stops, and its mean is a quieter
-        // estimate of where the camera was than the single last sample.
-        val poseWindow = ArrayDeque<OrientationData>()
-        val poseWindowSize = 20
 
         // Until the user taps, focus holds the centre of the first scene the
         // lens saw. AE and AWB are already locked by the session, so this pins
@@ -463,104 +469,78 @@ fun PhotoSphereCameraScreen(
             lockFocusAt(0.5f, 0.5f)
         }
 
+        // Collecting suspends across the shutter, which is what keeps a second
+        // capture from starting while one is still being written — the
+        // StateFlow simply conflates the samples that arrive meanwhile.
         tracker.orientation.collect { orientation ->
-            if (!orientation.hasFix) return@collect
             accuracy = orientation.accuracy
 
-            poseWindow.addLast(orientation)
-            while (poseWindow.size > poseWindowSize) poseWindow.removeFirst()
-
-            // A frame landing halfway through a stitch would not be in the set
-            // being stitched, and would be deleted when that set is cleared.
-            if (stitchJob != null) {
-                gate.reset()
-                // Drop the dwell's samples too, so a pose mean that fires right
-                // after the stitch finishes never mixes in frames aimed elsewhere.
-                poseWindow.clear()
-                return@collect
-            }
-
-            val currentPlan = plan
-                ?: SphereTargetPlan.createForFieldOfView(
-                    startYawDegrees = orientation.yawDegrees,
-                    fieldOfView = currentFieldOfView,
-                    scope = captureScope,
-                ).also { plan = it }
-
-            val target = currentPlan.getOrNull(activeIndex)
-            if (target == null) {
-                // Sphere finished; stop guiding until the user starts a new one.
-                gate.reset()
-                alignment = AlignmentState()
-                isHolding = false
-                return@collect
-            }
-
-            val distance = SphereProjection.angularDistanceDegrees(orientation, target)
-
-            // Careful shooting: no frame is taken while the fused sensor says
-            // its own output is not to be believed. An unreliable magnetometer
-            // drifts the reported aim by degrees even when the phone is still,
-            // and a frame placed on the sphere by that aim would land off its
-            // target no matter how long it is held. Merely *uncalibrated* is
-            // fine — see OrientationAccuracy.allowsCapture.
-            if (!orientation.accuracy.allowsCapture) {
-                gate.reset()
-                alignment = AlignmentState(distanceDegrees = distance)
-                isHolding = false
-                return@collect
-            }
-
-            val reading = gate.update(distance, SystemClock.elapsedRealtime())
-            alignment = AlignmentState(
-                distanceDegrees = distance,
-                dwellProgress = reading.dwellProgress,
-                isAligned = reading.isAligned,
+            val decision = coordinator.onSample(
+                orientation = orientation,
+                nowMillis = SystemClock.elapsedRealtime(),
+                // A frame landing halfway through a stitch would not be in the
+                // set being stitched, and would be deleted when that set is
+                // cleared.
+                isStitching = stitchJob != null,
+                createPlan = { startYawDegrees ->
+                    SphereTargetPlan.createForFieldOfView(
+                        startYawDegrees = startYawDegrees,
+                        fieldOfView = currentFieldOfView,
+                        scope = captureScope,
+                    )
+                },
             )
-            isHolding = reading.isAligned
 
-            // The pose mean is only trustworthy if every sample in it came from
-            // this deliberate stop, so a sample that fails the gate empties the
-            // window again. When the shutter fires, the window is exactly the
-            // dwell.
-            if (!reading.isAligned) poseWindow.clear()
+            when (decision) {
+                CaptureDecision.Ignore -> Unit
 
-            if (!reading.isTriggered) return@collect
-
-            val index = activeIndex
-            alignment = alignment.copy(isCapturing = true)
-            val result = capture.saveFrame(
-                context = context,
-                buffer = buffer,
-                index = index,
-                orientation = meanOrientation(poseWindow.toList()),
-                burstPerTarget = deviceProfile.burstPerTarget,
-            )
-            alignment = alignment.copy(isCapturing = false)
-
-            // The dwell that produced this frame is spent either way. Left in
-            // place, its samples would still be sitting in the window when the
-            // next target's dwell completes, and that frame's pose would be an
-            // average of two different aims.
-            poseWindow.clear()
-
-            result
-                .onSuccess {
-                    feedback.onFrameCaptured()
-                    // Advance only on a frame that actually landed, so a failed
-                    // capture is retried rather than silently skipped.
-                    activeIndex = index + 1
-                    gate.reset()
+                is CaptureDecision.Guide -> {
+                    alignment = decision.alignment
+                    isHolding = decision.isHolding
                 }
-                .onFailure { error ->
-                    Log.e(TAG, "Frame $index failed", error)
-                    gate.reset()
-                    scope.launch {
-                        snackbarHostState.showSnackbar(
-                            context.getString(R.string.capture_failed, error.message.orEmpty())
-                        )
-                    }
+
+                is CaptureDecision.Capture -> {
+                    alignment = decision.alignment
+                    // A trigger only ever comes out of an aligned reading.
+                    isHolding = true
+
+                    val result = capture.saveFrame(
+                        context = context,
+                        buffer = buffer,
+                        index = decision.index,
+                        orientation = decision.pose,
+                        burstPerTarget = deviceProfile.burstPerTarget,
+                    )
+                    alignment = alignment.copy(isCapturing = false)
+
+                    result
+                        .onSuccess {
+                            // The token is what makes this safe: a run restarted
+                            // or stepped back while the frame was being written
+                            // refuses the advance, so the reticle never lands
+                            // past a target nothing was shot at. The tick is
+                            // confirmation the frame counted, so it follows the
+                            // same answer.
+                            if (coordinator.onCaptured(decision.token)) {
+                                feedback.onFrameCaptured()
+                            }
+                        }
+                        .onFailure { error ->
+                            Log.e(TAG, "Frame ${decision.index} failed", error)
+                            // Stays on the same target, so a failed capture is
+                            // retried rather than silently skipped.
+                            coordinator.onCaptureFailed(decision.token)
+                            scope.launch {
+                                snackbarHostState.showSnackbar(
+                                    context.getString(
+                                        R.string.capture_failed,
+                                        error.message.orEmpty(),
+                                    )
+                                )
+                            }
+                        }
                 }
+            }
         }
     }
 
@@ -572,25 +552,8 @@ fun PhotoSphereCameraScreen(
     // frame exists, so this is really just the initial layout.
     LaunchedEffect(fieldOfView, captureScope) {
         if (buffer.frames.value.isEmpty()) {
-            plan = null
-            activeIndex = 0
-            isHolding = false
-            alignment = AlignmentState()
+            resetGuidance()
         }
-    }
-
-    val totalTargets = plan?.size ?: 0
-    val isComplete = totalTargets > 0 && activeIndex >= totalTargets
-    val capturedTargets = activeIndex.coerceAtMost(totalTargets)
-    val completedRings = plan?.completedRings(capturedTargets) ?: 0
-    val ringCount = plan?.ringCount ?: 0
-
-    /** Clears the guidance state so the next sphere starts from scratch. */
-    fun resetGuidance() {
-        plan = null
-        activeIndex = 0
-        isHolding = false
-        alignment = AlignmentState()
     }
 
     /**
@@ -760,8 +723,8 @@ fun PhotoSphereCameraScreen(
             TargetOverlay(
                 orientation = { orientationState.value },
                 alignment = { alignment },
-                plan = plan,
-                activeIndex = activeIndex,
+                plan = guidance.plan,
+                activeIndex = guidance.activeIndex,
                 fieldOfView = fieldOfView,
             )
 
@@ -770,7 +733,7 @@ fun PhotoSphereCameraScreen(
                 modifier = Modifier.fillMaxSize(),
             )
 
-            if (showInstructions && activeIndex == 0 && bufferedFrames.isEmpty()) {
+            if (showInstructions && guidance.activeIndex == 0 && bufferedFrames.isEmpty()) {
                 CaptureInstructions(
                     onDismiss = { showInstructions = false },
                     modifier = Modifier.fillMaxSize(),
@@ -778,22 +741,22 @@ fun PhotoSphereCameraScreen(
             }
 
             CaptureHud(
-                capturedCount = capturedTargets,
-                totalTargets = totalTargets,
-                completedRings = completedRings,
-                ringCount = ringCount,
+                capturedCount = guidance.capturedTargets,
+                totalTargets = guidance.totalTargets,
+                completedRings = guidance.completedRings,
+                ringCount = guidance.ringCount,
                 hint = captureHint(
                     isSensorAvailable = tracker.isSensorAvailable,
                     isCameraReady = imageCapture != null,
-                    hasPlan = plan != null,
-                    isComplete = isComplete,
+                    hasPlan = guidance.plan != null,
+                    isComplete = guidance.isComplete,
                     isHolding = isHolding,
                     accuracy = accuracy,
-                    completedRings = completedRings,
-                    ringCount = ringCount,
+                    completedRings = guidance.completedRings,
+                    ringCount = guidance.ringCount,
                 ),
                 lockBadge = lockBadge,
-                isComplete = isComplete,
+                isComplete = guidance.isComplete,
                 captureScope = captureScope,
                 // A mode change would renumber the targets already-shot frames
                 // were aimed at, so the choice is made before the first frame.
@@ -806,20 +769,31 @@ fun PhotoSphereCameraScreen(
                     stitchJob == null,
                 onFinish = { startStitch() },
                 onRestart = {
-                    resetGuidance()
-                    scope.launch { buffer.cancelSession() }
+                    scope.launch {
+                        resetGuidance()
+                        buffer.cancelSession()
+                    }
                 },
                 // A blurred frame, or one shot while something moved through the
                 // scene: undoing pops it off the buffer and puts its target back
                 // on the reticle so it can simply be shot again.
                 canUndo = bufferedFrames.isNotEmpty() && stitchJob == null,
+                // Inert while a shutter is in flight: that frame is not in the
+                // buffer yet, so an undo would drop the one before it and then
+                // be overwritten when the capture advances the run. The
+                // coordinator refuses it regardless — dimming is what makes the
+                // refusal visible rather than a tap that does nothing. It stays
+                // on screen rather than disappearing, because a control that
+                // vanished on every one of thirty-odd captures would read as a
+                // glitch.
+                undoEnabled = !guidance.isCapturing,
                 onUndo = {
                     scope.launch {
-                        val undone = buffer.undoLastFrame() ?: return@launch
-                        activeIndex = undone.index
-                        isHolding = false
-                        alignment = AlignmentState()
-                        gate.reset()
+                        val undone = coordinator.undo { buffer.undoLastFrame()?.index }
+                        if (undone) {
+                            isHolding = false
+                            alignment = AlignmentState()
+                        }
                     }
                 },
                 // Debug A/B for the lens model; hidden in release builds.
@@ -833,6 +807,85 @@ fun PhotoSphereCameraScreen(
                     .fillMaxSize()
                     .padding(insets),
             )
+
+            // Nothing bound: no preview under it and no targets to guide toward,
+            // so this covers the screen rather than sitting alongside a HUD that
+            // has nothing to report.
+            cameraError?.let { message ->
+                CameraErrorCard(
+                    message = message,
+                    onRetry = { bindAttempt++ },
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(insets),
+                )
+            }
+        }
+    }
+}
+
+/**
+ * What the screen shows when the camera will not start.
+ *
+ * A bind fails for reasons that pass — another app holding the camera, a
+ * provider that had not finished starting, a lens the device withdrew — so the
+ * failure is worth stating and worth offering a second go at. Without this the
+ * screen keeps a live-looking viewfinder over a camera that never bound, and
+ * the only way out is to kill the app.
+ */
+@Composable
+private fun CameraErrorCard(
+    message: String,
+    onRetry: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Box(
+        modifier = modifier.background(Color.Black.copy(alpha = 0.82f)),
+        contentAlignment = Alignment.Center,
+    ) {
+        Surface(
+            modifier = Modifier.padding(horizontal = 28.dp),
+            shape = RoundedCornerShape(24.dp),
+            color = Color(0xFF11161A),
+            tonalElevation = 6.dp,
+            shadowElevation = 20.dp,
+        ) {
+            Column(
+                modifier = Modifier.padding(24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(14.dp),
+            ) {
+                Text(
+                    text = stringResource(R.string.capture_camera_unavailable),
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = Color.White,
+                    textAlign = TextAlign.Center,
+                )
+                Text(
+                    text = message,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = Color.White.copy(alpha = 0.75f),
+                    textAlign = TextAlign.Center,
+                )
+                Button(
+                    onClick = onRetry,
+                    shape = RoundedCornerShape(50),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = CaptureAccent,
+                        contentColor = Color.Black,
+                    ),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(50.dp),
+                ) {
+                    Text(
+                        text = stringResource(R.string.capture_camera_retry),
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                }
+            }
         }
     }
 }
@@ -858,6 +911,7 @@ private fun CaptureHud(
     onFinish: () -> Unit,
     onRestart: () -> Unit,
     canUndo: Boolean,
+    undoEnabled: Boolean,
     onUndo: () -> Unit,
     captureScope: SphereCaptureScope,
     canChangeScope: Boolean,
@@ -889,6 +943,7 @@ private fun CaptureHud(
         if (canUndo) {
             UndoButton(
                 onUndo = onUndo,
+                enabled = undoEnabled,
                 modifier = Modifier
                     .align(Alignment.TopStart)
                     .padding(start = 20.dp, top = 22.dp),
@@ -1112,23 +1167,28 @@ private fun CaptureProgressPill(
  * The StreetView-style "undo that shot" control: a small glass button that
  * drops the most recently captured frame and puts its target back on the
  * reticle. Only appears once there is something to undo.
+ *
+ * Dimmed and inert while a shutter is in flight — the frame being written is
+ * not in the buffer yet, so there is a moment where "the last shot" is not the
+ * one the user means.
  */
 @Composable
 private fun UndoButton(
     onUndo: () -> Unit,
     modifier: Modifier = Modifier,
+    enabled: Boolean = true,
 ) {
     Surface(
         modifier = modifier,
         shape = CircleShape,
-        color = Color.Black.copy(alpha = 0.5f),
+        color = Color.Black.copy(alpha = if (enabled) 0.5f else 0.3f),
         shadowElevation = 8.dp,
     ) {
-        IconButton(onClick = onUndo) {
+        IconButton(onClick = onUndo, enabled = enabled) {
             Icon(
                 imageVector = Icons.AutoMirrored.Filled.Undo,
                 contentDescription = stringResource(R.string.capture_undo),
-                tint = Color.White,
+                tint = Color.White.copy(alpha = if (enabled) 1f else 0.4f),
             )
         }
     }

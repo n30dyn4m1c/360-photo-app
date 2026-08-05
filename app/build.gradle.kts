@@ -107,6 +107,8 @@ dependencies {
     implementation(libs.opencv)
 
     testImplementation(libs.junit)
+    // runTest / test dispatchers, for the capture coordinator's suspending API.
+    testImplementation(libs.kotlinx.coroutines.test)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
     androidTestImplementation(platform(libs.androidx.compose.bom))

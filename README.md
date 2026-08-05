@@ -77,8 +77,10 @@ workflow also runs on demand from the Actions tab.
 ```
 
 The unit tests cover the parts of the pipeline that are pure Kotlin: the sphere
-target plan, the projection maths, the alignment gate, the equirectangular fit,
-the stitch status mapping and the GPano XMP splice. Everything that needs real
+target plan, the projection maths, the alignment gate, the capture
+coordinator's rule and its serialisation of capture against undo and restart,
+the equirectangular fit, the stitch status mapping and the GPano XMP splice.
+Everything that needs real
 hardware — the camera, the rotation vector sensor, OpenCV's native stitch — is
 verified on a device. The **Orientation debug** button in the top-right of debug
 builds exists for exactly that: it puts the live sensor readout on screen so a
@@ -186,6 +188,7 @@ app/src/main/java/com/n30dyn4m1c/photosphere/
 ├── PhotoSphereApplication.kt    # OpenCV native init
 ├── camera/
 │   ├── PhotoSphereCameraScreen.kt # CameraX preview + the capture loop
+│   ├── SphereCaptureCoordinator.kt # the capture rule and the run's position
 │   ├── TargetOverlay.kt         # reticle, target markers, dwell arc
 │   ├── SphereTarget.kt          # the sphere's target list
 │   ├── SphereProjection.kt      # attitude + target -> screen position
@@ -336,6 +339,24 @@ inside it. Targets are circles rather than footprints: a hollow one is "still to
 cover", a filled green one is "done", and the live target pulses with a dashed
 guide line back to the reticle — collapsing to a chevron on the border when it
 is off-screen, so the user always knows which way to turn.
+
+**Who decides.** The rule that turns attitude into a shutter lives in
+[`SphereCaptureCoordinator`](app/src/main/java/com/n30dyn4m1c/photosphere/camera/SphereCaptureCoordinator.kt),
+not in the screen: it owns the plan, the index the run is on, the dwell and the
+window of samples a frame's pose is averaged over, and it has no camera and no
+Compose behind it, so the whole rule is driven directly by unit tests. What is
+left in `PhotoSphereCameraScreen` is the half that needs an `ImageCapture`.
+
+That split is also what makes the run's position safe to move. A capture,
+an undo and a "start over" all move it, and they are not naturally exclusive —
+a capture suspends for hundreds of milliseconds while its frame is written, and
+an undo tapped inside that window used to read and write the active index in
+between the capture reading it and writing it back. Whichever wrote last won,
+and the reticle was left pointing at a target that had never been shot. All
+three now go through one lock: an undo during a shutter is refused outright
+(the button dims to say so), and a capture that reports back after the run has
+been restarted or stepped back is discarded rather than applied to the run that
+replaced it.
 
 **The trigger.** [`AlignmentGate`](app/src/main/java/com/n30dyn4m1c/photosphere/camera/AlignmentGate.kt)
 fires once the aim has been within **2°** of the active target continuously for

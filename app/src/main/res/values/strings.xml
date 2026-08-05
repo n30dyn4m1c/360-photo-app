@@ -11,6 +11,8 @@
 
     <string name="capture_starting">Starting camera…</string>
     <string name="capture_failed">Capture failed: %1$s</string>
+    <string name="capture_camera_unavailable">Camera unavailable</string>
+    <string name="capture_camera_retry">Try again</string>
 
     <!-- Guided capture HUD. -->
     <string name="capture_scope_sphere">Sphere</string>

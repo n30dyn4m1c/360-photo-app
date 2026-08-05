@@ -19,6 +19,10 @@ junit = "4.13.2"
 androidxJunit = "1.2.1"
 espressoCore = "3.6.1"
 
+# Matches the coroutines the lifecycle and Compose artifacts already pull in;
+# used by the unit tests that drive suspending code directly.
+coroutines = "1.8.1"
+
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
 androidx-lifecycle-runtime-ktx = { group = "androidx.lifecycle", name = "lifecycle-runtime-ktx", version.ref = "lifecycle" }
@@ -47,6 +51,7 @@ androidx-exifinterface = { group = "androidx.exifinterface", name = "exifinterfa
 opencv = { group = "org.opencv", name = "opencv", version.ref = "opencv" }
 
 junit = { group = "junit", name = "junit", version.ref = "junit" }
+kotlinx-coroutines-test = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-test", version.ref = "coroutines" }
 androidx-junit = { group = "androidx.test.ext", name = "junit", version.ref = "androidxJunit" }
 androidx-espresso-core = { group = "androidx.test.espresso", name = "espresso-core", version.ref = "espressoCore" }
 
