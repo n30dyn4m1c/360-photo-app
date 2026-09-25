@@ -79,6 +79,7 @@ internal object SeamFeather {
         gridWidth: Int,
         gridHeight: Int,
         halfWidth: Int,
+        wrapLongitude: Boolean = false,
     ): Pair<IntArray, FloatArray> {
         val size = gridWidth * gridHeight
         val loserLabel = IntArray(size) { -1 }
@@ -93,13 +94,23 @@ internal object SeamFeather {
                 var bestDistance = halfWidth + 1
                 val minRow = max(0, r - halfWidth)
                 val maxRow = min(gridHeight - 1, r + halfWidth)
-                val minCol = max(0, c - halfWidth)
-                val maxCol = min(gridWidth - 1, c + halfWidth)
                 for (nr in minRow..maxRow) {
-                    for (nc in minCol..maxCol) {
+                    for (dc in -halfWidth..halfWidth) {
+                        // On a full-turn canvas the ±180° meridian wraps: a
+                        // window that runs past the left edge keeps looking at
+                        // the row's far end, so the loser ramp can cross the
+                        // seam (the column distance is just |dc| — the window
+                        // is narrower than the grid, so the wrapped distance to
+                        // a wrapped neighbour is the offset itself).
+                        var nc = c + dc
+                        if (wrapLongitude) {
+                            nc = ((nc % gridWidth) + gridWidth) % gridWidth
+                        } else if (nc < 0 || nc >= gridWidth) {
+                            continue
+                        }
                         val neighbour = labelMap[nr * gridWidth + nc]
                         if (neighbour < 0 || neighbour == winner) continue
-                        val distance = max(abs(nr - r), abs(nc - c))
+                        val distance = max(abs(nr - r), abs(dc))
                         if (distance < bestDistance) {
                             bestDistance = distance
                             bestLabel = neighbour

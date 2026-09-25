@@ -5,20 +5,31 @@
     <string name="permission_camera_title">Camera access needed</string>
     <string name="permission_camera_rationale">Photo Sphere stitches a 360° panorama from frames it captures as you pan the device, so it needs access to the camera.</string>
     <string name="permission_camera_denied_permanently">Camera access is turned off for this app. Enable it in Settings to capture a sphere.</string>
-    <string name="permission_storage_rationale">Storage access is needed to save finished spheres to your gallery on this version of Android.</string>
     <string name="permission_grant">Grant access</string>
     <string name="permission_open_settings">Open settings</string>
 
     <string name="capture_starting">Starting camera…</string>
     <string name="capture_failed">Capture failed: %1$s</string>
+    <string name="capture_camera_lost">The camera became unavailable — close other camera apps, then leave and re-enter to retry.</string>
 
     <!-- Guided capture HUD. -->
     <string name="capture_scope_sphere">Sphere</string>
     <string name="capture_scope_ring">Horizon ring</string>
-    <string name="capture_progress_frames">frames</string>
+    <!-- Counted strings are plurals so translations can be correct in every
+         language; see the issue on English-only strings. -->
+    <plurals name="capture_progress_frames">
+        <item quantity="one">frame</item>
+        <item quantity="other">frames</item>
+    </plurals>
     <!-- Spoken by a screen reader in place of the progress pill's separate numbers. -->
-    <string name="capture_progress_description">%1$d of %2$d frames captured</string>
-    <string name="capture_rings">%1$d of %2$d bands</string>
+    <plurals name="capture_progress_description">
+        <item quantity="one">%1$d of %2$d frame captured</item>
+        <item quantity="other">%1$d of %2$d frames captured</item>
+    </plurals>
+    <plurals name="capture_rings">
+        <item quantity="one">%1$d of %2$d band</item>
+        <item quantity="other">%1$d of %2$d bands</item>
+    </plurals>
     <string name="capture_lock_focusing">Focusing…</string>
     <string name="capture_lock_locked">Focus locked · AE &amp; WB locked</string>
     <string name="capture_lock_hint">Tap the viewfinder to focus</string>
@@ -26,6 +37,17 @@
     <string name="capture_hint_search">Move the reticle onto the marker</string>
     <string name="capture_hint_hold">Hold still…</string>
     <string name="capture_hint_ring_done">Band %1$d of %2$d covered — stitch now, or keep going</string>
+
+    <!-- Non-visual guidance: sound and haptics so capture can be driven without
+         sight. English-only for now, like the rest of the strings. -->
+    <string name="guidance_toggle_show">Sound guidance</string>
+    <string name="guidance_toggle_hide">Mute guidance</string>
+    <string name="guidance_target">Next: %1$s</string>
+    <string name="guidance_above">above you</string>
+    <string name="guidance_below">below you</string>
+    <string name="guidance_left">to your left</string>
+    <string name="guidance_right">to your right</string>
+    <string name="guidance_behind">behind you</string>
     <string name="capture_waiting_for_orientation">Finding your bearing…</string>
     <string name="capture_low_accuracy">Compass roughly calibrated — a figure eight will sharpen it</string>
     <string name="capture_accuracy_blocked">Compass unreliable — wave the phone in a figure eight</string>
@@ -70,6 +92,10 @@
     <string name="result_badge">360°</string>
     <string name="result_dimensions">%1$d × %2$d · equirectangular</string>
     <string name="result_preview_description">Preview of the stitched 360° photo, flattened</string>
+    <string name="result_view_flat">Flat</string>
+    <string name="result_view_panorama">Panorama</string>
+    <string name="result_view_panorama_description">Pannable preview of the stitched 360° photo — drag to look around, pinch to zoom</string>
+    <string name="result_export_in_progress">Still saving — wait for it to finish</string>
     <string name="result_preview_failed">The preview couldn\'t be shown, but the photo is intact — export or share it to check.</string>
     <string name="result_export">Export to gallery</string>
     <string name="result_exporting">Saving…</string>

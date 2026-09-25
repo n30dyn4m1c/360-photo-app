@@ -22,7 +22,7 @@ result screen offers it to the gallery and the share sheet.
 | Gradle | 9.5.0 (via wrapper) |
 | Kotlin | 2.2.10 |
 | JDK | 17 |
-| compileSdk / targetSdk | 35 |
+| compileSdk / targetSdk | 37 |
 | minSdk | 26 |
 
 `minSdk` is 26 so the project can rely on adaptive launcher icons and modern
@@ -31,7 +31,7 @@ lowering it is possible — you would need to add pre-API-26 launcher icon PNGs.
 
 ## Build
 
-You need the Android SDK (compileSdk 35 + build-tools 35) and a JDK 17. The
+You need the Android SDK (compileSdk 37 + build-tools 37) and a JDK 17. The
 simplest route is Android Studio, which supplies both: open the project folder,
 let it sync, and it writes `local.properties` for you. From the command line:
 
@@ -150,8 +150,12 @@ Declared in
 | `HIGH_SAMPLING_RATE_SENSORS` | **normal** (install-time, API 31+) | >200 Hz gyro/accel sampling to track device attitude between frames |
 | `VIBRATE` | **normal** (install-time) | Haptic tick confirming an automatic capture |
 | `WRITE_EXTERNAL_STORAGE` | runtime, `maxSdkVersion="28"` | Saving on pre-scoped-storage devices |
-| `READ_EXTERNAL_STORAGE` | runtime, `maxSdkVersion="32"` | Reading spheres this app did not create |
-| `READ_MEDIA_IMAGES` | runtime (API 33+) | Same, on Android 13+ |
+
+No READ permission is declared: the app never reads the user's photo library —
+captured frames and finished spheres live in the app's own cache until the user
+exports them — so neither `READ_EXTERNAL_STORAGE` nor `READ_MEDIA_IMAGES` is
+declared, which also keeps the Android 14+ selected-photos grant state from
+ever arising.
 
 `HIGH_SAMPLING_RATE_SENSORS` is a normal permission — it is granted at install
 time, and requesting it at runtime always returns "denied". Declaring it is
@@ -202,12 +206,13 @@ app/src/main/java/com/n30dyn4m1c/photosphere/
 │   ├── PhotoSphereCameraScreen.kt # CameraX preview + the capture loop
 │   ├── TargetOverlay.kt         # reticle, target markers, dwell arc
 │   ├── SphereTarget.kt          # the sphere's target list
+│   ├── TargetSelection.kt       # which target is active (any-order capture)
 │   ├── SphereProjection.kt      # attitude + target -> screen position
 │   ├── AlignmentGate.kt         # 2° / 300 ms shutter rule
 │   ├── CameraOptics.kt          # field of view from the camera's optics
 │   └── CaptureFeedback.kt       # shutter sound + haptic tick
 ├── sensor/
-│   ├── OrientationTracker.kt    # rotation vector -> yaw/pitch/roll StateFlow
+│   ├── OrientationTracker.kt    # game rotation vector -> yaw/pitch/roll StateFlow
 │   ├── OrientationState.kt      # lifecycle-aware Compose bindings
 │   └── OrientationDebugScreen.kt# live readout for on-device verification
 ├── stitching/
@@ -305,16 +310,24 @@ sight; see the open issues.
 ## Device orientation
 
 [`OrientationTracker`](app/src/main/java/com/n30dyn4m1c/photosphere/sensor/OrientationTracker.kt)
-listens to `TYPE_ROTATION_VECTOR` — the *fused* sensor, so the attitude is
-absolute, north-referenced and drift-free — and publishes it as a
-`StateFlow<OrientationData>` of yaw, pitch and roll in degrees.
+listens to `TYPE_GAME_ROTATION_VECTOR` (gyroscope + accelerometer, falling back
+to `TYPE_ROTATION_VECTOR` on a device without one) and publishes it as a
+`StateFlow<OrientationData>` of yaw, pitch and roll in degrees. The game vector
+leaves the magnetometer out — the same choice Street View and Google Camera's
+Photo Sphere make. A sphere only needs the aim to be consistent *between
+frames*, and the compass is the one input that can make a still phone's heading
+jump by degrees indoors (a steel beam, a laptop, rebar in the floor); without it
+yaw is relative to an arbitrary zero and drifts by a fraction of a degree a
+minute instead, which a capture of a couple of minutes absorbs in its overlap.
+Nothing asks the user for a figure-eight calibration any more.
 
 The angles are read straight off the device→world rotation matrix, so they
 describe **where the rear camera points**, not the screen:
 
 1. **The camera basis.** `getRotationMatrixFromVector` gives the matrix mapping
-   device axes to the world frame (X east, Y north, Z up). The lens looks along
-   the device's -Z axis, so that is the camera's forward. Yaw is its compass
+   device axes to the world frame (Z up; with the game vector X and Y are a
+   fixed but arbitrary horizontal pair rather than east and north). The lens
+   looks along the device's -Z axis, so that is the camera's forward. Yaw is its
    bearing, elevation its height above the horizon (reported as a pitch that is
    **negative above the horizon**, matching the capture plan and the stitcher),
    and roll is the image's tilt about the forward axis.
@@ -384,10 +397,21 @@ frames stay a constant *angular* distance apart instead of bunching up as the
 rings shrink. The 35% overlap is what the feature-based pose refinement needs:
 it leaves every frame well inside its neighbours' view, and is the margin that
 absorbs a field-of-view estimate that runs high and a degree or two of sensor
-drift (see [Stitching](#stitching)). Rings are swept in alternating directions,
-and the whole plan is rotated to start at whatever bearing the user is already
-facing — capture opens with the reticle on the first marker rather than asking
-for magnetic north.
+drift (see [Stitching](#stitching)). The plan's default path is the horizon,
+then every ring up to the zenith, then every ring down to the nadir, each swept
+opposite to the one before, so the user never swings between ceiling and floor
+more than once. The whole plan is rotated to start at whatever bearing the user
+is already facing, and the stitched photo is centred on that bearing too — every
+360 viewer opens on the scene the run began with, and the wrap-around seam sits
+directly behind it.
+
+**Any order, Street View style.** The path is a default, not a rule
+([`TargetSelection`](app/src/main/java/com/n30dyn4m1c/photosphere/camera/TargetSelection.kt)).
+Aim squarely (within 6°) at any other uncaptured dot and it becomes the active
+target — fill a gap you can see, skip a frame someone is walking through and
+come back to it, or shoot in whatever order is comfortable. After each shot the
+active target hands over to the nearest uncaptured dot, with the plan's next one
+given a 12° head start so an ordinary sweep keeps its direction.
 
 The plan is laid out against 90% of the reported field of view, not all of it
 (`FIELD_OF_VIEW_SAFETY_FACTOR`). The overlap is only ever as good as the field
@@ -433,10 +457,20 @@ fires once the aim has been within **2°** of the active target continuously for
 **300 ms**. The dwell is what keeps a frame from being taken mid-swing: at a
 normal pan rate the reticle crosses a 2° window in far less than 300 ms, so only
 a deliberate stop trips it. Any sample outside the window clears the timer
-outright. The shutter also refuses to fire while the fused sensor reports its
-readings as unreliable, and the attitude stamped onto each frame is the mean
-over the dwell rather than a single sample — both take the jitter out of the
-pose the stitcher starts from. On success the shutter sound and a haptic tick
+outright. The shutter also refuses to fire while a compass-fused sensor reports
+its readings as unreliable (the game vector has no such state), and the
+attitude stamped onto each frame is the mean over the dwell rather than a single
+sample — both take the jitter out of the pose the stitcher starts from.
+
+**Bursts keep their own poses.** A burst of max-quality stills takes a couple of
+seconds on a Samsung, and the dwell mean only describes the moment before the
+first shot. Each shot therefore records the attitude at its own shutter
+(`onCaptureStarted`); the kept shot is stamped with the dwell mean only if it
+is within 0.4° of it, and with its own sample otherwise — so a hand that eases
+off after the first flash cannot put a later shot on the sphere where the first
+one was aimed. The sharpest shot is judged on the central half of the frame at
+the stitch's own ~2000 px input size, where a few pixels of handshake smear
+actually shows, rather than on a thumbnail where every candidate scores alike. On success the shutter sound and a haptic tick
 fire together, the marker turns green, and focus animates onto the next target.
 
 **Tap to focus, locked for the session.** Phone lenses have a fixed physical
@@ -667,7 +701,7 @@ The result is equirectangular *by construction* rather than by cropping
 something else into shape: a pixel's row is its latitude, so an incomplete sphere
 is black exactly where it was not shot, at the right elevation. The accuracy
 ceiling is how much of the residual pose error the content can resolve — the
-rotation vector sensor is fused and drift-free but not perfect, and the feature
+fused attitude sensor is steady but not perfect, and the feature
 refinement pulls the overlaps back into agreement instead of leaving soft
 doubling.
 

@@ -759,9 +759,15 @@ internal fun wrapColumn(column: Int, width: Int): Int {
  * land within one field of view on both axes — the condition for two
  * axis-aligned field-of-view windows to intersect, since two frames each
  * reaching half a field of view either side of their aim meet exactly when
- * their aims are less than one full field of view apart. The returned value is
- * the squared angular separation (tangent-space), so a smaller value is a
- * stronger shared view, which is how the pose graph orders its edges.
+ * their aims are less than one full field of view apart. In tangent space that
+ * bound is `2·tan(fov/2)`: each window spans `tan(fov/2)` either side of its
+ * aim, and the windows touch when the aims are `2·tan(fov/2)` apart. (Not
+ * `tan(fov)` — the two only agree at small angles, and at a 52° field of view
+ * `tan(52°)` is ~31% looser than the true bound, admitting pairs whose frames
+ * do not actually overlap into the pose graph and the exposure tie.) The
+ * returned value is the squared angular separation (tangent-space), so a
+ * smaller value is a stronger shared view, which is how the pose graph orders
+ * its edges.
  */
 internal fun angularOverlap(
     a: CameraBasis,
@@ -773,17 +779,18 @@ internal fun angularOverlap(
     if (depth <= MIN_DEPTH) return null
     val horizontalSeparation = abs(a.lateralOf(b.forwardX, b.forwardY, b.forwardZ) / depth)
     val verticalSeparation = abs(a.verticalOf(b.forwardX, b.forwardY, b.forwardZ) / depth)
-    if (horizontalSeparation >= tanOf(horizontalFovDegrees)) return null
-    if (verticalSeparation >= tanOf(verticalFovDegrees)) return null
+    if (horizontalSeparation >= overlapBound(horizontalFovDegrees)) return null
+    if (verticalSeparation >= overlapBound(verticalFovDegrees)) return null
     return horizontalSeparation * horizontalSeparation + verticalSeparation * verticalSeparation
 }
 
 /**
- * `tan(degrees)`, saturating at a right angle.
+ * `2·tan(degrees / 2)`, the tangent-space reach of one full field of view,
+ * saturating at a right angle.
  *
  * A field of view of 90° or more spans the whole half-space in that axis, where
  * the tangent flips sign and would reject every pair; the overlap test wants
  * "no bound at all" instead.
  */
-private fun tanOf(degrees: Float): Double =
-    if (degrees >= 90f) Double.MAX_VALUE else tan(Math.toRadians(degrees.toDouble()))
+private fun overlapBound(degrees: Float): Double =
+    if (degrees >= 90f) Double.MAX_VALUE else 2.0 * tan(Math.toRadians(degrees / 2.0))

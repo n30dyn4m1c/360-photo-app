@@ -105,6 +105,11 @@ internal fun resolveOpticalStabilization(stabilizationModes: IntArray?): Boolean
 /**
  * The capture profile for this device's rear camera.
  *
+ * [cameraId] pins the profile to a specific lens (the one that actually bound,
+ * once known); without it the profile is resolved for the lens the device
+ * profile would bind, which is the right answer until a fallback changes the
+ * lens.
+ *
  * Deliberately does not throw: a camera that will not describe itself gets the
  * most conservative profile (locks everything, tap-to-focus on the first scene)
  * rather than failing capture.
@@ -112,9 +117,16 @@ internal fun resolveOpticalStabilization(stabilizationModes: IntArray?): Boolean
 internal fun resolveSphereCaptureProfile(
     context: Context,
     profile: SphereDeviceProfile,
+    cameraId: String? = null,
 ): SphereCaptureProfile {
-    val characteristics =
-        runCatching { backCameraCharacteristics(context, profile) }.getOrNull()
+    val characteristics = runCatching {
+        if (cameraId != null) {
+            context.getSystemService(CameraManager::class.java)
+                ?.getCameraCharacteristics(cameraId)
+        } else {
+            backCameraCharacteristics(context, profile)
+        }
+    }.getOrNull()
     return SphereCaptureProfile(
         focusMode = resolveFocusMode(
             minimumFocusDistance =

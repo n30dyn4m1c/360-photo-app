@@ -24,6 +24,7 @@ import java.io.File
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
+import kotlin.math.sqrt
 import kotlin.math.tan
 
 private const val TAG = "PhotoSphereStitcher"
@@ -334,7 +335,21 @@ object PhotoSphereStitcher {
         latitudeSpanDegrees: Float = 180f,
         centerLatitudeDegrees: Float = 0f,
         onProgress: (StitchProgress) -> Unit = {},
-    ): Result<Bitmap> = withContext(Dispatchers.Default) {
+    ): Result<Bitmap> {
+        // The span arguments size the canvas; degenerate values would otherwise
+        // drive the allocation to Int.MAX_VALUE rows (or a zero-width canvas)
+        // and surface as a confusing OutOfMemory instead of a clear error.
+        require(longitudeSpanDegrees in 1f..360f) {
+            "longitudeSpanDegrees must be in 1..360, was $longitudeSpanDegrees"
+        }
+        require(latitudeSpanDegrees in 1f..180f) {
+            "latitudeSpanDegrees must be in 1..180, was $latitudeSpanDegrees"
+        }
+        require(centerLatitudeDegrees in -90f..90f) {
+            "centerLatitudeDegrees must be in -90..90, was $centerLatitudeDegrees"
+        }
+
+        return withContext(Dispatchers.Default) {
         val decoded = ArrayList<DecodedFrame>(frames.size)
         try {
             onProgress(StitchProgress.Preparing)
@@ -384,7 +399,8 @@ object PhotoSphereStitcher {
                 ensureActive()
                 onProgress(StitchProgress(StitchStage.Reading, position, frames.size))
 
-                var image = readFrame(frame.file, maxInputDimension)
+                val read = readFrame(frame.file, maxInputDimension)
+                var image = read.image
 
                 // From here the frame is owned by this iteration: a failure
                 // before it is handed to `decoded` — the FOV correction, the
@@ -401,12 +417,25 @@ object PhotoSphereStitcher {
                     // against the measured pose and no two frames line up.
                     // `portraitRotationDegrees` is exactly the turn CameraX
                     // would have recorded in the tag.
-                    if (image.cols() > image.rows() && portraitRotationDegrees % 180 == 90) {
+                    //
+                    // The fallback is gated on the tag being genuinely absent.
+                    // A frame whose tag is *present* (including NORMAL) is the
+                    // camera's own statement about its orientation, and a
+                    // landscape frame with NORMAL is a genuine landscape
+                    // capture — rotating it would paint its content sideways
+                    // against its pose, which is exactly the failure the
+                    // fallback exists to prevent for portrait frames. Those
+                    // frames go on to [correctFovOrientation] landscape, which
+                    // adapts the field of view to their real shape.
+                    if (image.cols() > image.rows() &&
+                        !read.hasExifOrientation &&
+                        portraitRotationDegrees % 180 == 90
+                    ) {
                         Log.w(
                             TAG,
-                            "Frame $position decoded ${image.cols()}x${image.rows()} — " +
-                                "transposed against the ${horizontalFov}°x${verticalFov}° FOV; " +
-                                "rotating ${portraitRotationDegrees}° clockwise",
+                            "Frame $position decoded ${image.cols()}x${image.rows()} with no " +
+                                "EXIF orientation — rotating ${portraitRotationDegrees}° " +
+                                "clockwise against the ${horizontalFov}°x${verticalFov}° FOV",
                         )
                         image = rotateClockwise(image, portraitRotationDegrees)
                     }
@@ -652,6 +681,7 @@ object PhotoSphereStitcher {
             decoded.forEach { it.image.release() }
         }
     }
+    }
 
     /**
      * Canvas width that matches the detail in the frames.
@@ -685,6 +715,9 @@ object PhotoSphereStitcher {
         longitudeSpanDegrees: Float,
         latitudeSpanDegrees: Float,
     ): Int {
+        // Guarded in stitchPhotos too; this keeps the function safe on its own
+        // (a zero span would otherwise compute Infinity -> Int.MAX_VALUE).
+        require(longitudeSpanDegrees > 0f) { "longitude span must be positive" }
         val height = (canvasWidth * latitudeSpanDegrees / longitudeSpanDegrees).roundToInt()
         return height.coerceAtLeast(1)
     }
@@ -695,12 +728,15 @@ object PhotoSphereStitcher {
      *
      * A lens has square pixels, so the focal length the horizontal field of
      * view implies for the frame's width must match the one the vertical field
-     * of view implies for its height. If the angles arrived transposed — the
-     * axes of the sensor rather than of the upright frame — the two implied
-     * focal lengths differ by roughly the square of the aspect ratio (0.56 for
-     * a 4:3 frame), which is far beyond any field-of-view estimation error. The
-     * boundary is drawn at 1 ± 30%: generous enough never to trip on a
-     * loosely-described lens, unambiguous enough that a genuine swap is caught.
+     * of view implies for its height: a correctly-aligned pairing has a
+     * min/max focal ratio of exactly 1. If the angles arrived transposed — the
+     * axes of the sensor rather than of the upright frame — the ratio is the
+     * square of the frame's aspect (0.56 for a 4:3 frame), far beyond any
+     * field-of-view estimation error. The swap boundary sits halfway between
+     * the two in log space — `sqrt(transposed ratio)` — so a pairing is
+     * swapped only when it is closer to the transposed expectation than to the
+     * aligned one, which keeps genuinely asymmetric FOVs (an extreme crop on
+     * one axis) from being mis-swapped by an arbitrary constant.
      *
      * Returns the corrected pair, or null when the angles already match the
      * frame.
@@ -720,9 +756,24 @@ object PhotoSphereStitcher {
         val ratio =
             if (horizontalFocal >= verticalFocal) verticalFocal / horizontalFocal
             else horizontalFocal / verticalFocal
-        if (ratio >= 0.7) return null
+        val aspect = widthPx.toDouble() / heightPx
+        val transposedRatio = if (aspect >= 1.0) 1.0 / (aspect * aspect) else aspect * aspect
+        if (ratio >= sqrt(transposedRatio)) return null
         return verticalFovDegrees to horizontalFovDegrees
     }
+
+    /**
+     * One decoded frame plus whether its EXIF orientation tag was present.
+     *
+     * The tag's *presence* is what lets the decode loop tell "the camera says
+     * this frame is landscape" from "the tag was lost and this is a portrait
+     * frame still in its sensor-native shape". See the rotation fallback in
+     * [stitchPhotos].
+     */
+    private class ReadFrame(
+        val image: Mat,
+        val hasExifOrientation: Boolean,
+    )
 
     /**
      * Decodes one frame into the 8-bit 3-channel matrix the renderer samples.
@@ -733,7 +784,14 @@ object PhotoSphereStitcher {
      * otherwise hand the renderer a mix of portrait and landscape frames while
      * the field of view describes only one of them.
      */
-    private fun readFrame(file: File, maxDimension: Int): Mat {
+    private fun readFrame(file: File, maxDimension: Int): ReadFrame {
+        // Read the tag's presence before decoding: ExifInterface.getAttributeInt
+        // cannot distinguish a present NORMAL tag from a missing one, and the
+        // rotation fallback depends on that distinction.
+        val hasExifOrientation = runCatching {
+            ExifInterface(file).getAttribute(ExifInterface.TAG_ORIENTATION) != null
+        }.getOrDefault(false)
+
         val bitmap = decodeUpright(file, maxDimension)
             ?: throw StitchException(
                 StitchStatus.UnreadableInput,
@@ -752,7 +810,7 @@ object PhotoSphereStitcher {
             rgba.release()
             bitmap.recycle()
         }
-        return rgb
+        return ReadFrame(rgb, hasExifOrientation)
     }
 
     /**
@@ -784,7 +842,13 @@ object PhotoSphereStitcher {
     /** Copies the finished canvas out into a bitmap the UI can show. */
     private fun toBitmap(canvas: Mat): Bitmap {
         val bitmap = Bitmap.createBitmap(canvas.cols(), canvas.rows(), Bitmap.Config.ARGB_8888)
-        Utils.matToBitmap(canvas, bitmap)
+        try {
+            Utils.matToBitmap(canvas, bitmap)
+        } catch (e: Throwable) {
+            // A malformed canvas must not leak the bitmap it was about to fill.
+            bitmap.recycle()
+            throw e
+        }
         return bitmap
     }
 
@@ -925,9 +989,15 @@ object PhotoSphereStitcher {
             else -> return bitmap
         }
 
-        val rotated = Bitmap.createBitmap(
-            bitmap, 0, 0, bitmap.width, bitmap.height, matrix, /* filter = */ true,
-        )
+        val rotated = try {
+            Bitmap.createBitmap(
+                bitmap, 0, 0, bitmap.width, bitmap.height, matrix, /* filter = */ true,
+            )
+        } catch (e: Throwable) {
+            // An allocation failure must not leak the decoded source bitmap.
+            bitmap.recycle()
+            throw e
+        }
         if (rotated !== bitmap) bitmap.recycle()
         return rotated
     }
