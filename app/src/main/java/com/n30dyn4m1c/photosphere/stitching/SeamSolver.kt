@@ -82,6 +82,7 @@ internal object SeamSolver {
         smoothLambda: Double,
         maxPasses: Int = 2,
         onExpansion: () -> Unit = {},
+        wrapLongitude: Boolean = false,
     ): IntArray {
         val labels = greedyLabels(grid)
 
@@ -92,7 +93,7 @@ internal object SeamSolver {
         repeat(maxPasses) {
             var changed = false
             for (alpha in order) {
-                if (expandTo(grid, smoothLambda, labels, alpha)) changed = true
+                if (expandTo(grid, smoothLambda, labels, alpha, wrapLongitude)) changed = true
                 onExpansion()
             }
             if (!changed) return labels
@@ -199,6 +200,7 @@ internal object SeamSolver {
         smoothLambda: Double,
         labels: IntArray,
         alpha: Int,
+        wrapLongitude: Boolean = false,
     ): Boolean {
         // Nodes that may move: exactly those [alpha] covers.
         val active = BooleanArray(grid.nodeCount)
@@ -258,6 +260,22 @@ internal object SeamSolver {
                 if (grid.nodeLabelCount[n] == 0) continue
                 if (c + 1 < grid.width) {
                     val m = n + 1
+                    if (grid.nodeLabelCount[m] > 0) {
+                        addEdgeTerm(
+                            grid, smoothLambda, labels, active, vertexOf, flow,
+                            n, m, curColor, alphaColor, scratch, u0, u1,
+                        )
+                    }
+                }
+                // A full-turn canvas is a cylinder in longitude: the first and
+                // last columns sample the same world direction at the ±180°
+                // meridian, so the seam must be allowed to cut *between* them
+                // only at the same cost as anywhere else. Without this edge the
+                // two sides of the meridian could pick different winning frames
+                // with zero smoothness penalty and show a hard, unfeathered
+                // seam when the panorama is viewed wrapped.
+                if (wrapLongitude && c == 0 && grid.width > 1) {
+                    val m = n + grid.width - 1
                     if (grid.nodeLabelCount[m] > 0) {
                         addEdgeTerm(
                             grid, smoothLambda, labels, active, vertexOf, flow,

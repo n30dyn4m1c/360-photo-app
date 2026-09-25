@@ -20,6 +20,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.PhotoLibrary
@@ -40,6 +41,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -51,6 +53,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asAndroidBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
@@ -95,6 +98,9 @@ private sealed interface ExportState {
     data class Done(val displayName: String) : ExportState
 }
 
+/** How the finished sphere is shown: the honest flat frame, or the pano view. */
+private enum class PreviewMode { Flat, Panorama }
+
 /**
  * What the user sees when a stitch finishes: the sphere, and what to do with it.
  *
@@ -104,10 +110,11 @@ private sealed interface ExportState {
  * afterwards. From here it can go to the gallery, out through the share sheet,
  * or nowhere at all.
  *
- * The preview is flat, not a sphere viewer. It shows the equirectangular frame
- * as it is, which is the honest picture of what was captured: the black wedges
- * at the poles are the parts of the sphere the run never reached, and they are
- * worth seeing before deciding to keep it.
+ * The preview defaults to the flat equirectangular frame, which is the honest
+ * picture of what was captured: the black wedges at the poles are the parts of
+ * the sphere the run never reached, and they are worth seeing before deciding
+ * to keep it. A toggle switches to a pannable inside-out sphere view for
+ * inspecting seams and the horizon where they actually matter.
  *
  * @param sphere the finished photo, as [SphereImageStore.writeStitchedSphere] left it
  * @param onTakeAnother discards this sphere and returns to capture
@@ -125,6 +132,10 @@ fun PanoramaResultScreen(
     var preview by remember(sphere.file) { mutableStateOf<ImageBitmap?>(null) }
     var isPreviewFailed by remember(sphere.file) { mutableStateOf(false) }
     var exportState by remember(sphere.file) { mutableStateOf<ExportState>(ExportState.Idle) }
+    var previewMode by remember(sphere.file) { mutableStateOf(PreviewMode.Flat) }
+    // Decoded lazily the first time the user switches to the pano view: the GL
+    // texture is a few megabytes and the flat preview is the default.
+    var panoBitmap by remember(sphere.file) { mutableStateOf<Bitmap?>(null) }
 
     LaunchedEffect(sphere.file) {
         val decoded = withContext(Dispatchers.IO) { decodePreview(sphere.file) }
@@ -132,7 +143,31 @@ fun PanoramaResultScreen(
             isPreviewFailed = true
             Log.w(TAG, "Could not decode a preview of ${sphere.file.name}")
         } else {
+            // The previous preview is dead the moment this one lands; recycle it
+            // rather than letting ~4 MB of bitmap wait for GC on a low-memory
+            // device with several result screens behind it.
+            preview?.asAndroidBitmap()?.recycle()
             preview = decoded.asImageBitmap()
+        }
+    }
+
+    LaunchedEffect(sphere.file, previewMode) {
+        if (previewMode == PreviewMode.Panorama && panoBitmap == null) {
+            val decoded = withContext(Dispatchers.IO) {
+                decodePreview(sphere.file, PANO_TEXTURE_MAX_DIMENSION)
+            }
+            if (decoded != null) {
+                panoBitmap?.recycle()
+                panoBitmap = decoded
+            }
+        }
+    }
+
+    // The bitmaps are the screen's own scratch; hand them back when it goes.
+    DisposableEffect(sphere.file) {
+        onDispose {
+            preview?.asAndroidBitmap()?.recycle()
+            panoBitmap?.recycle()
         }
     }
 
@@ -141,9 +176,26 @@ fun PanoramaResultScreen(
     // [DiscardConfirmation].
     var isConfirmingDiscard by remember(sphere.file) { mutableStateOf(false) }
     val isSaved = exportState is ExportState.Done
+    val isWorking = exportState is ExportState.Working
 
-    /** Leaves the screen, pausing to confirm if the photo would be lost. */
+    /**
+     * Leaves the screen, pausing to confirm if the photo would be lost.
+     *
+     * While an export is in flight the copy cannot be cancelled (it is
+     * [NonCancellable] once the MediaStore row exists), so leaving now would
+     * contradict the discard prompt: the photo would land in the gallery after
+     * the user confirmed its destruction, with the success feedback swallowed.
+     * The exit waits for the copy instead.
+     */
     fun leave() {
+        if (isWorking) {
+            scope.launch {
+                snackbarHostState.showSnackbar(
+                    context.getString(R.string.result_export_in_progress)
+                )
+            }
+            return
+        }
         if (isSaved) onTakeAnother() else isConfirmingDiscard = true
     }
 
@@ -225,8 +277,16 @@ fun PanoramaResultScreen(
                 }
             }
 
+            PreviewModeSelector(
+                mode = previewMode,
+                onModeChange = { previewMode = it },
+                modifier = Modifier.align(Alignment.CenterHorizontally),
+            )
+
             SpherePreview(
                 preview = preview,
+                panoBitmap = panoBitmap,
+                mode = previewMode,
                 isFailed = isPreviewFailed,
                 modifier = Modifier
                     .fillMaxWidth()
@@ -321,10 +381,62 @@ private fun DiscardConfirmation(
     )
 }
 
-/** The equirectangular frame, letterboxed into whatever space is going. */
+/** Flat frame or pannable sphere: the two ways of looking at the result. */
+@Composable
+private fun PreviewModeSelector(
+    mode: PreviewMode,
+    onModeChange: (PreviewMode) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    // The same exclusive segmented pill the capture screen uses for its scope
+    // choice: Flat is the default — the honest overview — and Panorama is the
+    // inspection tool.
+    Row(
+        modifier = modifier
+            .clip(PillShape)
+            .background(MaterialTheme.colorScheme.surfaceVariant)
+            .padding(3.dp)
+            .selectableGroup(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(3.dp),
+    ) {
+        PreviewMode.entries.forEach { option ->
+            val selected = option == mode
+            Surface(
+                shape = PillShape,
+                color = if (selected) MaterialTheme.colorScheme.primary else Color.Transparent,
+                onClick = { onModeChange(option) },
+            ) {
+                Text(
+                    text = stringResource(
+                        when (option) {
+                            PreviewMode.Flat -> R.string.result_view_flat
+                            PreviewMode.Panorama -> R.string.result_view_panorama
+                        }
+                    ),
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+                    color = if (selected) {
+                        MaterialTheme.colorScheme.onPrimary
+                    } else {
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    },
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
+                )
+            }
+        }
+    }
+}
+
+/**
+ * The preview well: either the equirectangular frame letterboxed into the
+ * space, or the pannable sphere view of the same pixels.
+ */
 @Composable
 private fun SpherePreview(
     preview: ImageBitmap?,
+    panoBitmap: Bitmap?,
+    mode: PreviewMode,
     isFailed: Boolean,
     modifier: Modifier = Modifier,
 ) {
@@ -347,6 +459,12 @@ private fun SpherePreview(
         contentAlignment = Alignment.Center,
     ) {
         when {
+            mode == PreviewMode.Panorama && panoBitmap != null -> PanoramaSphereView(
+                bitmap = panoBitmap,
+                contentDescription = stringResource(R.string.result_view_panorama_description),
+                modifier = Modifier.fillMaxSize(),
+            )
+
             preview != null -> Image(
                 bitmap = preview,
                 contentDescription = stringResource(R.string.result_preview_description),
@@ -535,13 +653,13 @@ private fun Context.shareSphere(file: File): Boolean {
 }
 
 /** Decodes [file] down to something a phone screen can hold. */
-private fun decodePreview(file: File): Bitmap? {
+private fun decodePreview(file: File, maxDimension: Int = PREVIEW_MAX_DIMENSION): Bitmap? {
     val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
     BitmapFactory.decodeFile(file.path, bounds)
     if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
 
     val options = BitmapFactory.Options().apply {
-        inSampleSize = sampleSizeFor(bounds.outWidth, bounds.outHeight, PREVIEW_MAX_DIMENSION)
+        inSampleSize = sampleSizeFor(bounds.outWidth, bounds.outHeight, maxDimension)
     }
     return BitmapFactory.decodeFile(file.path, options)
 }

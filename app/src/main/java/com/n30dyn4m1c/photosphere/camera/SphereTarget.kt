@@ -109,13 +109,18 @@ data class SphereTargetPlan(
     val ringCount: Int get() = rings.size
 
     /**
-     * How many whole rings the first [capturedCount] targets cover.
+     * How many rings every one of whose targets is in [captured].
      *
      * Counting closed rings rather than frames is what makes "you have a
      * complete band, stitch now or carry on" something the screen can say.
+     * Targets can be shot in any order (see [TargetSelection]), so a ring is
+     * closed by its members, not by a count.
      */
-    fun completedRings(capturedCount: Int): Int =
-        rings.count { capturedCount > it.last }
+    fun completedRings(captured: Set<Int>): Int =
+        rings.count { ring -> ring.all { it in captured } }
+
+    /** How many of this plan's targets are in [captured]. */
+    fun capturedCount(captured: Set<Int>): Int = captured.count { it in targets.indices }
 
     companion object {
         /**
@@ -292,20 +297,22 @@ data class SphereTargetPlan(
                 MAX_RING_ELEVATION_DEGREES,
                 max(step, 90f - verticalFovDegrees / 2f + step / 2f),
             )
-            val elevations = mutableListOf(0f)
+            val upward = mutableListOf<Float>()
             // Intermediate rings only while they are clearly below the cap — a
             // ring within half a step of it would be a near-duplicate zenith
             // ring, which an ultra-wide lens (a step of ~70° plus a cap of ~72°)
             // would otherwise produce.
             var elevation = step
             while (elevation < cap - step / 2f) {
-                elevations += elevation
-                elevations += -elevation
+                upward += elevation
                 elevation += step
             }
-            elevations += cap
-            elevations += -cap
-            return elevations
+            upward += cap
+            // Capture order: the horizon, every ring up to the zenith, then
+            // every ring down to the nadir — the order of
+            // [DEFAULT_RING_ELEVATIONS]. Interleaving up and down rings would
+            // swing the user between ceiling and floor once per ring pair.
+            return listOf(0f) + upward + upward.map { -it }
         }
     }
 }

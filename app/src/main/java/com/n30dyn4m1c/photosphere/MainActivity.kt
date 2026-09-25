@@ -193,7 +193,7 @@ private fun PhotoSphereApp(modifier: Modifier = Modifier) {
 }
 
 /** Where the user currently stands with a set of runtime permissions. */
-private enum class PermissionStatus {
+internal enum class PermissionStatus {
     /** Not asked yet, or the system will show the dialog on the next request. */
     Unknown,
 
@@ -205,6 +205,38 @@ private enum class PermissionStatus {
 
     /** Denied with "don't ask again" (or blocked by policy) — only Settings helps. */
     PermanentlyDenied,
+}
+
+/**
+ * The verdict after a runtime-permission request returns.
+ *
+ * Extracted from the launcher callback so the state machine can be pinned by
+ * unit tests. The decision deliberately reads the *grants*, not the result
+ * map, and treats an empty map as a cancellation, not a grant:
+ *
+ * - Asked of the system, not inferred from `results`. When the dialog is
+ *   dismissed without an answer — a swipe away, a phone call taking the
+ *   foreground, the screen locking — the contract delivers an *empty* map, and
+ *   `emptyMap().values.all { }` is vacuously true. Read straight from the map,
+ *   that cancellation would have counted as a grant and dropped the user into
+ *   a camera screen with no camera permission, where the bind fails and the
+ *   viewfinder is simply black.
+ * - A real denial the system will still show a dialog for, or that same
+ *   cancellation, both land in [PermissionStatus.ShowRationale]. The retry is
+ *   what matters: `shouldShowRationale` reads false after a cancel, so trusting
+ *   it here would send someone who never answered the dialog off to the
+ *   Settings app to fix a setting they had not touched. Only an explicit
+ *   "deny" that the system will no longer surface a dialog for earns that trip.
+ */
+internal fun resolvePermissionStatus(
+    results: Map<String, Boolean>,
+    hasAll: Boolean,
+    anyShouldShowRationale: Boolean,
+): PermissionStatus = when {
+    hasAll -> PermissionStatus.Granted
+    results.isEmpty() -> PermissionStatus.ShowRationale
+    anyShouldShowRationale -> PermissionStatus.ShowRationale
+    else -> PermissionStatus.PermanentlyDenied
 }
 
 /**
@@ -233,35 +265,21 @@ private fun RequirePermissions(
             }
         )
     }
-    var hasRequested by remember { mutableStateOf(false) }
+    // Saveable so an activity recreation (font scale, dark mode, foldable
+    // resize) does not re-fire the system dialog at a user who already answered
+    // it — a permanently-denied user would get a silent no-op request, and a
+    // merely-denied one an unprompted dialog.
+    var hasRequested by rememberSaveable { mutableStateOf(false) }
 
     val launcher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { results ->
-        status = when {
-            // Asked of the system, not inferred from `results`. When the dialog
-            // is dismissed without an answer — a swipe away, a phone call taking
-            // the foreground, the screen locking — the contract delivers an
-            // *empty* map, and `emptyMap().values.all { }` is vacuously true. Read
-            // straight from the map, that cancellation would have counted as a
-            // grant and dropped the user into a camera screen with no camera
-            // permission, where the bind fails and the viewfinder is simply black.
-            context.hasAllPermissions(permissions) -> PermissionStatus.Granted
-
-            // A real denial the system will still show a dialog for, or that same
-            // cancellation. Both leave the user somewhere they can retry from,
-            // which is what matters: `shouldShowRationale` reads false after a
-            // cancel, so trusting it here would send someone who never answered
-            // the dialog off to the Settings app to fix a setting they had not
-            // touched. Only an explicit "deny" that the system will no longer
-            // surface a dialog for earns that trip.
-            results.isEmpty() -> PermissionStatus.ShowRationale
-
-            activity != null && permissions.any(activity::shouldShowRationale) ->
-                PermissionStatus.ShowRationale
-
-            else -> PermissionStatus.PermanentlyDenied
-        }
+        status = resolvePermissionStatus(
+            results = results,
+            hasAll = context.hasAllPermissions(permissions),
+            anyShouldShowRationale = activity != null &&
+                permissions.any(activity::shouldShowRationale),
+        )
     }
 
     // Ask once, automatically, the first time the gate is shown.

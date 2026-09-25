@@ -6,6 +6,7 @@ import org.opencv.imgproc.Imgproc
 import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.roundToInt
 import kotlin.math.sin
 
@@ -139,7 +140,10 @@ internal object SeamFinder {
 
         for (gridRow in 0 until gridHeight) {
             checkCancelled()
-            val centerRow = gridRow * scale + scale / 2
+            // The sample sits at the centre of the grid pixel's block; a canvas
+            // that is not a multiple of the scale has a last block shorter than
+            // scale, so the centre is clamped onto the canvas.
+            val centerRow = min(gridRow * scale + scale / 2, canvasHeight - 1)
             val latitude = Math.toRadians(
                 Equirectangular.latitudeDegrees(
                     centerRow, canvasHeight, latitudeSpanDegrees, centerLatitudeDegrees,
@@ -148,7 +152,7 @@ internal object SeamFinder {
             val cosLatitude = cos(latitude)
             val sinLatitude = sin(latitude)
             for (gridCol in 0 until gridWidth) {
-                val centerCol = gridCol * scale + scale / 2
+                val centerCol = min(gridCol * scale + scale / 2, canvasWidth - 1)
                 val longitude = Math.toRadians(
                     Equirectangular.longitudeDegrees(
                         centerCol, canvasWidth, longitudeSpanDegrees, centerLongitudeDegrees,
@@ -263,9 +267,16 @@ internal object SeamFinder {
                 progressDone++
                 onProgress(progressDone, totalProgress)
             },
+            // A full-turn canvas is a cylinder in longitude: the solver and the
+            // feather treat the first and last columns as neighbours, so the
+            // seam can cross the ±180° meridian without showing a hard edge.
+            wrapLongitude = longitudeSpanDegrees >= 360f,
         )
         val halfWidth = max(1, FEATHER_FULL_RES_PIXELS / scale)
-        val (loserLabel, loserWeight) = SeamFeather.derive(labels, gridWidth, gridHeight, halfWidth)
+        val (loserLabel, loserWeight) = SeamFeather.derive(
+            labels, gridWidth, gridHeight, halfWidth,
+            wrapLongitude = longitudeSpanDegrees >= 360f,
+        )
         return SeamWeights(gridWidth, gridHeight, scale, labels, loserLabel, loserWeight)
     }
 

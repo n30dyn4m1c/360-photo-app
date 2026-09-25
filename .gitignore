@@ -18,3 +18,7 @@ local.properties
 # time. Test builds are published as GitHub Release assets instead — see the
 # "Test builds" section of the README.
 *.apk
+
+# Local tool state: the Kotlin compiler cache and the opencode agent workspace.
+/.kotlin/
+/.opencode/

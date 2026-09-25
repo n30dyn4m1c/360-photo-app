@@ -11,6 +11,7 @@ import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.TotalCaptureResult
 import android.os.SystemClock
+import android.provider.Settings
 import android.util.Log
 import android.util.Size
 import androidx.camera.camera2.interop.Camera2CameraControl
@@ -47,16 +48,22 @@ import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Undo
+import androidx.compose.material.icons.filled.VolumeOff
+import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -82,6 +89,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -91,8 +99,10 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
@@ -113,7 +123,6 @@ import com.n30dyn4m1c.photosphere.metadata.GPanoMetadata
 import com.n30dyn4m1c.photosphere.sensor.OrientationAccuracy
 import com.n30dyn4m1c.photosphere.sensor.OrientationData
 import com.n30dyn4m1c.photosphere.sensor.currentDisplayRotation
-import com.n30dyn4m1c.photosphere.sensor.meanOrientation
 import com.n30dyn4m1c.photosphere.sensor.rememberOrientationTracker
 import com.n30dyn4m1c.photosphere.stitching.CameraPose
 import com.n30dyn4m1c.photosphere.stitching.PhotoSphereStitcher
@@ -123,6 +132,7 @@ import com.n30dyn4m1c.photosphere.stitching.StitchProgress
 import com.n30dyn4m1c.photosphere.stitching.StitchStage
 import com.n30dyn4m1c.photosphere.stitching.StitchStatus
 import com.n30dyn4m1c.photosphere.storage.ImageBufferManager
+import com.n30dyn4m1c.photosphere.storage.SessionSupersededException
 import com.n30dyn4m1c.photosphere.storage.SphereImageStore
 import com.n30dyn4m1c.photosphere.storage.SphereImageStore.StitchedSphere
 import com.n30dyn4m1c.photosphere.storage.rememberImageBufferManager
@@ -133,6 +143,8 @@ import com.n30dyn4m1c.photosphere.ui.theme.GlassSurface
 import com.n30dyn4m1c.photosphere.ui.theme.GlassSurfaceDim
 import com.n30dyn4m1c.photosphere.ui.theme.PillShape
 import com.n30dyn4m1c.photosphere.ui.theme.SphereAccent
+import com.n30dyn4m1c.photosphere.ui.theme.SphereOnSurface
+import com.n30dyn4m1c.photosphere.ui.theme.SphereOnSurfaceVariant
 import com.n30dyn4m1c.photosphere.ui.theme.SphereSurface
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineStart
@@ -141,13 +153,16 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.yield
 import java.io.File
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
+import kotlin.math.acos
 import kotlin.math.roundToInt
 
 private const val TAG = "PhotoSphereCamera"
@@ -175,8 +190,9 @@ private const val THREE_A_LOCK_TIMEOUT_MS = 6_000L
  * field of view above and below the horizon when held upright. Rolling the
  * phone in its own plane can reach further — the corners sweep out the frame's
  * half-diagonal, which for a tall portrait frame is noticeably wider than the
- * vertical half-angle — so the band is widened to comfortably cover that plus a
- * degree or two of aim error from the gate and any pose-refinement movement.
+ * vertical half-angle (and for a landscape frame, wider still in the other
+ * sense) — so the band is widened to comfortably cover that plus a degree or
+ * two of aim error from the gate and any pose-refinement movement.
  */
 private const val RING_LATITUDE_SPAN_FACTOR = 1.3f
 
@@ -227,12 +243,24 @@ fun PhotoSphereCameraScreen(
     // lambda reads it.
     val orientationState = tracker.orientation.collectAsStateWithLifecycle()
     val feedback = rememberCaptureFeedback()
+    val guidance = rememberGuidanceFeedback()
     val deviceProfile = remember { SphereDeviceProfile.forDevice() }
 
-    // Shared between the capture loop and the undo control: both need to reset a
-    // half-completed dwell. Kept at the screen's scope so an undo can reach it
-    // from outside the loop that runs it.
-    val gate = remember { AlignmentGate() }
+    // Non-visual guidance: beeps, dwell haptics and spoken target cues, so the
+    // capture loop can be driven without sight. Defaults on for a screen
+    // reader user; anyone else can switch it on from the HUD. The loops
+    // themselves sit further down, once the state they drive from exists.
+    var guidanceEnabled by rememberSaveable {
+        mutableStateOf(context.isScreenReaderActive())
+    }
+
+    // The capture loop's decision-making, and the single owner of where the run
+    // has got to. Capture, undo and restart all move that position, and they are
+    // not naturally exclusive — a capture suspends for hundreds of milliseconds
+    // while its frame is written — so they are serialised in there rather than
+    // raced against each other from here.
+    val coordinator = remember { SphereCaptureCoordinator() }
+    val run by coordinator.guidance.collectAsStateWithLifecycle()
 
     // Which lens CameraX actually bound, and the shape of the buffer it is
     // producing. Both are only knowable once the bind has resolved, and both
@@ -244,11 +272,25 @@ fun PhotoSphereCameraScreen(
     val optics = rememberSphereOptics(boundCameraId, streamAspectRatio)
     val fieldOfView = optics.fieldOfView
 
+    // True once the session's AE/AWB lock has been applied (either by the
+    // convergence callback or the timeout fallback). The capture loop waits for
+    // it before the first trigger: a still fired mid-convergence would be
+    // pinned to the exposure reached so far. Written from the camera thread and
+    // the main thread; Compose snapshot state is safe to write from either.
+    var isThreeALocked by remember { mutableStateOf(false) }
+
     // How much of the sphere the plan walks: the whole sphere (rings out to
     // both poles) or just the horizon ring — a regular pano that goes all the
     // way around. Locked once the first frame lands: re-planning under buffered
     // frames would renumber the targets they were shot against.
     var captureScope by rememberSaveable { mutableStateOf(SphereCaptureScope.Sphere) }
+
+    // The plan's anchor survives configuration changes (the buffer does too —
+    // see rememberImageBufferManager), so a recreation mid-run rebuilds the same
+    // plan rather than re-anchoring it at a fresh bearing. The walk position
+    // needs no saving: the coordinator moves off any target the buffer already
+    // holds a frame for (see TargetSelection).
+    var planStartYawDegrees by rememberSaveable { mutableFloatStateOf(Float.NaN) }
 
     // How tall the output canvas is, as a span of latitude. A sphere covers the
     // poles (180°); a ring covers only the band of latitude its level frames
@@ -286,10 +328,15 @@ fun PhotoSphereCameraScreen(
     // what the session is holding.
     var captureProfile by remember { mutableStateOf<SphereCaptureProfile?>(null) }
     var boundCamera by remember { mutableStateOf<Camera?>(null) }
-    var plan by remember { mutableStateOf<SphereTargetPlan?>(null) }
-    var activeIndex by remember { mutableIntStateOf(0) }
     var isHolding by remember { mutableStateOf(false) }
     var accuracy by remember { mutableStateOf(OrientationAccuracy.Unknown) }
+
+    // Why the camera did not start, and the counter that asks it to try again.
+    // A bind can fail for reasons that pass — another app holding the camera,
+    // a provider that was not ready — so the failure is a state the user can
+    // act on rather than a dead screen.
+    var cameraError by remember { mutableStateOf<String?>(null) }
+    var bindAttempt by remember { mutableIntStateOf(0) }
 
     // Lens model defaults. The sensor poses + pinhole combination is the
     // reliable core of the stitch; pose refinement can move frames off the
@@ -342,16 +389,92 @@ fun PhotoSphereCameraScreen(
      */
     var alignment by remember { mutableStateOf(AlignmentState()) }
 
+    /** Clears the guidance state so the next sphere starts from scratch. */
+    suspend fun resetGuidance() {
+        coordinator.reset()
+        planStartYawDegrees = Float.NaN
+        isHolding = false
+        alignment = AlignmentState()
+    }
+
+    // The guidance loop. Polls the alignment state (sensor-rate data) rather
+    // than observing it, at the beep cadence the state itself dictates — the
+    // audio never needs fresher input than its own period.
+    LaunchedEffect(guidanceEnabled, run.plan, run.activeIndex, tracker.isSensorAvailable) {
+        if (!guidanceEnabled || !tracker.isSensorAvailable) return@LaunchedEffect
+        var lastDwellProgress = 0f
+        while (true) {
+            val current = alignment
+            val complete = coordinator.guidance.value.isComplete
+            when {
+                // Aim guidance: beep at a rate that rises as the aim closes.
+                current.hasDistance && !current.isAligned && !complete -> {
+                    val interval = GuidanceProfile.beepIntervalMillis(current.distanceDegrees)
+                    if (interval != null) {
+                        guidance.beep()
+                        delay(interval)
+                    } else {
+                        delay(250)
+                    }
+                }
+
+                // Dwell feedback: a tick at the halfway point of the fill, so
+                // the imminent shutter is felt before the shutter tick itself.
+                current.isAligned && current.dwellProgress > 0f -> {
+                    if (GuidanceProfile.crossedDwellMilestone(
+                            lastDwellProgress,
+                            current.dwellProgress,
+                        )
+                    ) {
+                        guidance.dwellTick()
+                    }
+                    lastDwellProgress = current.dwellProgress
+                    delay(40)
+                }
+
+                else -> {
+                    lastDwellProgress = 0f
+                    delay(150)
+                }
+            }
+        }
+    }
+
+    // Spoken announcement per target: "next: above you, to your left". Fires on
+    // the hand-over, when the user has just completed a shot and is about to
+    // aim somewhere new.
+    LaunchedEffect(run.activeIndex, run.plan, guidanceEnabled, tracker.isSensorAvailable) {
+        if (!guidanceEnabled || !tracker.isSensorAvailable) return@LaunchedEffect
+        // The first target is wherever the user is already facing; announcing
+        // it would be noise.
+        if (buffer.frames.value.isEmpty()) return@LaunchedEffect
+        // The active target can also move because the aim swept across another
+        // dot; a short settle means only a target the user stays on is spoken,
+        // rather than every marker the reticle passes over.
+        delay(600)
+        val target = run.plan?.getOrNull(run.activeIndex) ?: return@LaunchedEffect
+        val orientation = orientationState.value
+        if (!orientation.hasFix) return@LaunchedEffect
+        val relation = GuidanceProfile.targetRelation(orientation, target)
+        guidance.announce(
+            context.getString(
+                R.string.guidance_target,
+                context.targetPhrase(relation),
+            )
+        )
+    }
+
     // Bind preview + capture once per lifecycle owner. CameraX unbinds on its own
-    // when that lifecycle is destroyed.
-    LaunchedEffect(lifecycleOwner, previewView) {
+    // when that lifecycle is destroyed. Re-keyed on [bindAttempt] so a failed
+    // bind can be retried without leaving and re-entering the screen.
+    LaunchedEffect(lifecycleOwner, previewView, bindAttempt) {
+        cameraError = null
+        isThreeALocked = false
         val cameraProvider = try {
             context.awaitCameraProvider()
         } catch (e: Exception) {
             Log.e(TAG, "Camera provider unavailable", e)
-            snackbarHostState.showSnackbar(
-                context.getString(R.string.capture_failed, e.message.orEmpty())
-            )
+            cameraError = context.getString(R.string.capture_failed, e.message.orEmpty())
             return@LaunchedEffect
         }
 
@@ -381,8 +504,14 @@ fun PhotoSphereCameraScreen(
         // to the values it settled on (see [lockThreeA]). The stills carry the
         // same locks so a capture fired mid-convergence cannot walk away from
         // what the viewfinder is showing.
-        var camera2Control: Camera2CameraControl? = null
-        var threeALocked = false
+        //
+        // Both holders are atomic: the convergence callback runs on the camera
+        // thread while the bind (and the 6 s timeout fallback) run on the main
+        // thread, so a plain local var would be a data race. `camera2Control`
+        // also becomes readable before the bind assigns it, so the guard has to
+        // survive a null read and let the timeout retry.
+        val camera2Control = AtomicReference<Camera2CameraControl?>(null)
+        val threeALocked = AtomicBoolean(false)
         // Locks AE and AWB on the repeating request. Deliberately a lambda
         // (rather than a local fun) so the session capture callback below can
         // capture it. Called from the camera thread when the 3A converges, and
@@ -391,19 +520,25 @@ fun PhotoSphereCameraScreen(
         // request — the preview — and to the stills, keeping the viewfinder and
         // every frame on one exposure and colour temperature.
         val lockThreeA = {
-            if (!threeALocked) {
-                val control = camera2Control
-                if (control != null) {
-                    threeALocked = true
-                    runCatching {
-                        control.addCaptureRequestOptions(
-                            CaptureRequestOptions.Builder()
-                                .setCaptureRequestOption(CaptureRequest.CONTROL_AE_LOCK, true)
-                                .setCaptureRequestOption(CaptureRequest.CONTROL_AWB_LOCK, true)
-                                .build()
-                        )
-                    }.onFailure { Log.w(TAG, "Could not lock 3A", it) }
+            // CAS states the intent: whichever caller wins the flag applies the
+            // options once, and a caller that found no control yet leaves the
+            // flag clear so the timeout can try again. A failed apply releases
+            // the claim so the timeout retries it.
+            val control = camera2Control.get()
+            if (control != null && threeALocked.compareAndSet(false, true)) {
+                runCatching {
+                    control.addCaptureRequestOptions(
+                        CaptureRequestOptions.Builder()
+                            .setCaptureRequestOption(CaptureRequest.CONTROL_AE_LOCK, true)
+                            .setCaptureRequestOption(CaptureRequest.CONTROL_AWB_LOCK, true)
+                            .build()
+                    )
                 }
+                    .onSuccess { isThreeALocked = true }
+                    .onFailure { error ->
+                        threeALocked.set(false)
+                        Log.w(TAG, "Could not lock 3A", error)
+                    }
             }
         }
         val preview = Preview.Builder()
@@ -497,9 +632,9 @@ fun PhotoSphereCameraScreen(
             boundCamera = camera
             // The lock target for the convergence callback: the session's
             // repeating request can only be touched once the camera is bound.
-            camera2Control = runCatching {
-                Camera2CameraControl.from(camera.cameraControl)
-            }.getOrNull()
+            camera2Control.set(
+                runCatching { Camera2CameraControl.from(camera.cameraControl) }.getOrNull()
+            )
             // The lens that answered, not the one that was asked for: a filter
             // that matched nothing, or a device that substitutes a logical
             // camera, both land here and both would otherwise leave the optics
@@ -507,12 +642,38 @@ fun PhotoSphereCameraScreen(
             boundCameraId = runCatching {
                 Camera2CameraInfo.from(camera.cameraInfo).cameraId
             }.getOrNull()
+            // The capture profile is resolved again against the lens that
+            // actually bound: when the widest-camera bind fell back to the
+            // default, the focus strategy and lock support may describe the
+            // other lens (a FIXED_FOCUS guess on a lens that can focus would
+            // kill tap-to-focus).
+            captureProfile = resolveSphereCaptureProfile(context, deviceProfile, boundCameraId)
             streamAspectRatio = capture.resolutionInfo
                 ?.resolution
                 ?.takeIf { it.width > 0 && it.height > 0 }
                 ?.let { it.width.toFloat() / it.height }
                 ?: 0f
             Log.i(TAG, "Bound camera $boundCameraId, stills $streamAspectRatio:1")
+
+            // Watch for the camera being taken away mid-run — another camera
+            // app grabbing the lens, the camera service dying, a thermal
+            // shutdown. Without this the capture loop would keep arming the
+            // shutter against a dead use case: every dwell would fail with a
+            // snackbar and nothing would recover. On an error the use case is
+            // dropped (which stops the loop and the HUD's capture offer) and
+            // the retry card goes up; its retry re-binds, and the buffered
+            // frames are untouched, so the run carries on where it was.
+            // The observer is tied to the lifecycle owner, so it goes away
+            // with the screen.
+            camera.cameraInfo.cameraState.observe(lifecycleOwner) { state ->
+                state.error?.let { error ->
+                    Log.e(TAG, "Camera error ${error.code}, capture disabled", error.cause)
+                    imageCapture = null
+                    boundCamera = null
+                    cameraError = context.getString(R.string.capture_camera_lost)
+                }
+            }
+
             // Some HALs never report CONVERGED for a scene; by the timeout the
             // repeating request has long since settled, so locking then is still
             // locking to a real exposure rather than the stream-start default.
@@ -523,9 +684,11 @@ fun PhotoSphereCameraScreen(
             }
         } catch (e: Exception) {
             Log.e(TAG, "Camera binding failed", e)
-            snackbarHostState.showSnackbar(
-                context.getString(R.string.capture_failed, e.message.orEmpty())
-            )
+            // Nothing is bound, so there is no viewfinder to put a transient
+            // snackbar over — the failure stays on screen with a way out of it.
+            imageCapture = null
+            boundCamera = null
+            cameraError = context.getString(R.string.capture_failed, e.message.orEmpty())
         }
     }
 
@@ -549,28 +712,30 @@ fun PhotoSphereCameraScreen(
         }
     }
 
+    // The stills' EXIF rotation has to follow the display. The activity locks
+    // portrait on phones, but Android 16+ ignores fixed orientation on large
+    // screens, so a tablet can be force-rotated mid-session: the optics and the
+    // sensor frame re-read on the configuration change, and this keeps the
+    // frames CameraX records carrying the rotation they were actually shot at.
+    // (The bind itself is keyed on the lifecycle, not the configuration, so the
+    // camera stays bound across the rotation.)
+    val configuration = LocalConfiguration.current
+    LaunchedEffect(configuration) {
+        imageCapture?.targetRotation = context.currentDisplayRotation()
+    }
+
     // Old sessions are dead weight once a new one starts; clearing them keeps the
     // cache from growing by a sphere's worth of full-resolution JPEGs per run.
     LaunchedEffect(sessionId) {
         buffer.pruneStaleSessions()
     }
 
-    // The capture loop. Collecting suspends across the shutter, which is what
-    // keeps a second capture from starting while one is still being written —
-    // the StateFlow simply conflates the samples that arrive meanwhile.
+    // The capture loop's camera half. The rule that decides whether the shutter
+    // fires lives in [SphereCaptureCoordinator]; what is left here is the part
+    // that needs an ImageCapture behind it.
     LaunchedEffect(imageCapture) {
         val capture = imageCapture ?: return@LaunchedEffect
         val profile = captureProfile ?: return@LaunchedEffect
-        // The gate is shared with the undo control, so a fresh camera bind starts
-        // with a clean dwell rather than whatever the previous bind left behind.
-        gate.reset()
-
-        // The pose stamped onto each frame is the mean over a short window of
-        // samples. The gate has just confirmed the aim held still for a dwell,
-        // so the window is all deliberate stops, and its mean is a quieter
-        // estimate of where the camera was than the single last sample.
-        val poseWindow = ArrayDeque<OrientationData>()
-        val poseWindowSize = 20
 
         // Until the user taps, focus holds the centre of the first scene the
         // lens saw. AE and AWB are already locked by the session, so this pins
@@ -581,104 +746,101 @@ fun PhotoSphereCameraScreen(
             lockFocusAt(0.5f, 0.5f)
         }
 
+        // Collecting suspends across the shutter, which is what keeps a second
+        // capture from starting while one is still being written — the
+        // StateFlow simply conflates the samples that arrive meanwhile.
         tracker.orientation.collect { orientation ->
-            if (!orientation.hasFix) return@collect
             accuracy = orientation.accuracy
 
-            poseWindow.addLast(orientation)
-            while (poseWindow.size > poseWindowSize) poseWindow.removeFirst()
-
-            // A frame landing halfway through a stitch would not be in the set
-            // being stitched, and would be deleted when that set is cleared.
-            if (stitchJob != null) {
-                gate.reset()
-                // Drop the dwell's samples too, so a pose mean that fires right
-                // after the stitch finishes never mixes in frames aimed elsewhere.
-                poseWindow.clear()
-                return@collect
-            }
-
-            val currentPlan = plan
-                ?: SphereTargetPlan.createForFieldOfView(
-                    startYawDegrees = orientation.yawDegrees,
-                    fieldOfView = currentFieldOfView,
-                    scope = captureScope,
-                ).also { plan = it }
-
-            val target = currentPlan.getOrNull(activeIndex)
-            if (target == null) {
-                // Sphere finished; stop guiding until the user starts a new one.
-                gate.reset()
-                alignment = AlignmentState()
-                isHolding = false
-                return@collect
-            }
-
-            val distance = SphereProjection.angularDistanceDegrees(orientation, target)
-
-            // Careful shooting: no frame is taken while the fused sensor says
-            // its own output is not to be believed. An unreliable magnetometer
-            // drifts the reported aim by degrees even when the phone is still,
-            // and a frame placed on the sphere by that aim would land off its
-            // target no matter how long it is held. Merely *uncalibrated* is
-            // fine — see OrientationAccuracy.allowsCapture.
-            if (!orientation.accuracy.allowsCapture) {
-                gate.reset()
-                alignment = AlignmentState(distanceDegrees = distance)
-                isHolding = false
-                return@collect
-            }
-
-            val reading = gate.update(distance, SystemClock.elapsedRealtime())
-            alignment = AlignmentState(
-                distanceDegrees = distance,
-                dwellProgress = reading.dwellProgress,
-                isAligned = reading.isAligned,
+            val decision = coordinator.onSample(
+                orientation = orientation,
+                nowMillis = SystemClock.elapsedRealtime(),
+                // A frame landing halfway through a stitch would not be in the
+                // set being stitched, and would be deleted when that set is
+                // cleared.
+                isStitching = stitchJob != null,
+                captured = { buffer.frames.value.mapTo(HashSet()) { it.index } },
+                // No frame before the session's AE/AWB lock has landed: a
+                // still fired mid-convergence is pinned to whatever exposure
+                // has been reached so far — on a dark scene, near black.
+                canTrigger = isThreeALocked,
+                createPlan = { yawNow ->
+                    // Rebuilt on the bearing it was originally anchored at
+                    // (saved across configuration changes) so a recreation
+                    // mid-run keeps the target numbering the buffered frames
+                    // were shot against.
+                    val startYaw =
+                        if (planStartYawDegrees.isNaN()) yawNow else planStartYawDegrees
+                    planStartYawDegrees = startYaw
+                    SphereTargetPlan.createForFieldOfView(
+                        startYawDegrees = startYaw,
+                        fieldOfView = currentFieldOfView,
+                        scope = captureScope,
+                    )
+                },
             )
-            isHolding = reading.isAligned
 
-            // The pose mean is only trustworthy if every sample in it came from
-            // this deliberate stop, so a sample that fails the gate empties the
-            // window again. When the shutter fires, the window is exactly the
-            // dwell.
-            if (!reading.isAligned) poseWindow.clear()
+            when (decision) {
+                CaptureDecision.Ignore -> Unit
 
-            if (!reading.isTriggered) return@collect
-
-            val index = activeIndex
-            alignment = alignment.copy(isCapturing = true)
-            val result = capture.saveFrame(
-                context = context,
-                buffer = buffer,
-                index = index,
-                orientation = meanOrientation(poseWindow.toList()),
-                burstPerTarget = deviceProfile.burstPerTarget,
-            )
-            alignment = alignment.copy(isCapturing = false)
-
-            // The dwell that produced this frame is spent either way. Left in
-            // place, its samples would still be sitting in the window when the
-            // next target's dwell completes, and that frame's pose would be an
-            // average of two different aims.
-            poseWindow.clear()
-
-            result
-                .onSuccess {
-                    feedback.onFrameCaptured()
-                    // Advance only on a frame that actually landed, so a failed
-                    // capture is retried rather than silently skipped.
-                    activeIndex = index + 1
-                    gate.reset()
+                is CaptureDecision.Guide -> {
+                    alignment = decision.alignment
+                    isHolding = decision.isHolding
                 }
-                .onFailure { error ->
-                    Log.e(TAG, "Frame $index failed", error)
-                    gate.reset()
-                    scope.launch {
-                        snackbarHostState.showSnackbar(
-                            context.getString(R.string.capture_failed, error.message.orEmpty())
-                        )
-                    }
+
+                is CaptureDecision.Capture -> {
+                    alignment = decision.alignment
+                    // A trigger only ever comes out of an aligned reading.
+                    isHolding = true
+
+                    val result = capture.saveFrame(
+                        context = context,
+                        buffer = buffer,
+                        index = decision.index,
+                        dwellOrientation = decision.pose,
+                        currentOrientation = { tracker.orientation.value },
+                        burstPerTarget = deviceProfile.burstPerTarget,
+                    )
+                    alignment = alignment.copy(isCapturing = false)
+
+                    result
+                        .onSuccess {
+                            // The token is what makes this safe: a run restarted
+                            // or stepped back while the frame was being written
+                            // refuses the advance, so the reticle never lands
+                            // past a target nothing was shot at. The tick is
+                            // confirmation the frame counted, so it follows the
+                            // same answer.
+                            val advanced = coordinator.onCaptured(
+                                token = decision.token,
+                                captured = buffer.frames.value.mapTo(HashSet()) { it.index },
+                                orientation = tracker.orientation.value,
+                            )
+                            if (advanced) feedback.onFrameCaptured()
+                        }
+                        .onFailure { error ->
+                            // Stays on the same target, so a failed capture is
+                            // retried rather than silently skipped.
+                            coordinator.onCaptureFailed(decision.token)
+                            if (error is SessionSupersededException) {
+                                // The user restarted the run while the shutter
+                                // was in flight; the frame disappearing is the
+                                // expected outcome, not a failure to report.
+                                Log.i(TAG, "Frame ${decision.index} dropped with its superseded session")
+                                return@onFailure
+                            }
+                            Log.e(TAG, "Frame ${decision.index} failed", error)
+                            scope.launch {
+                                snackbarHostState.showSnackbar(
+                                    context.getString(
+                                        R.string.capture_failed,
+                                        error.message.orEmpty(),
+                                    )
+                                )
+                            }
+                        }
                 }
+            }
         }
     }
 
@@ -690,26 +852,13 @@ fun PhotoSphereCameraScreen(
     // frame exists, so this is really just the initial layout.
     LaunchedEffect(fieldOfView, captureScope) {
         if (buffer.frames.value.isEmpty()) {
-            plan = null
-            activeIndex = 0
-            isHolding = false
-            alignment = AlignmentState()
+            resetGuidance()
         }
     }
 
-    val totalTargets = plan?.size ?: 0
-    val isComplete = totalTargets > 0 && activeIndex >= totalTargets
-    val capturedTargets = activeIndex.coerceAtMost(totalTargets)
-    val completedRings = plan?.completedRings(capturedTargets) ?: 0
-    val ringCount = plan?.ringCount ?: 0
-
-    /** Clears the guidance state so the next sphere starts from scratch. */
-    fun resetGuidance() {
-        plan = null
-        activeIndex = 0
-        isHolding = false
-        alignment = AlignmentState()
-    }
+    // Straight from the buffer, so a marker turns green the moment its frame
+    // lands rather than on the next sensor sample.
+    val capturedIndices = remember(bufferedFrames) { bufferedFrames.mapTo(HashSet()) { it.index } }
 
     /**
      * Hands the buffered frames to the stitcher and passes on what comes back.
@@ -723,10 +872,11 @@ fun PhotoSphereCameraScreen(
             // A shutter can be mid-flight when Finish is tapped: the frame it
             // is writing would land in the buffer after the snapshot below,
             // and would be deleted along with the stitched set — a silent
-            // coverage hole. Hold until the in-flight capture settles (the
-            // capture loop shares this dispatcher, so a yield lets it finish)
-            // before freezing the frame set.
-            while (alignment.isCapturing) yield()
+            // coverage hole. Hold until the in-flight capture settles before
+            // freezing the frame set. `snapshotFlow` waits on the state change
+            // instead of spinning the main dispatcher for the duration of the
+            // capture.
+            snapshotFlow { alignment.isCapturing }.first { !it }
 
             // The stitcher works from where each frame was shot, not just its
             // pixels: the capture attitude is what places it on the sphere.
@@ -772,7 +922,17 @@ fun PhotoSphereCameraScreen(
                     // and either the whole 180° of latitude (sphere) or the band
                     // a level ring actually covers.
                     longitudeSpanDegrees = 360f,
-                    centerLongitudeDegrees = 0f,
+                    // Centred on the first shot's bearing. The sensor's yaw
+                    // zero is arbitrary, so this is what puts the scene the
+                    // user started facing in the middle of the photo — where
+                    // every 360 viewer opens — and the ±180° wrap directly
+                    // behind them. (GPano stays centred at 0: the metadata
+                    // describes the image's own columns, not the sensor's.)
+                    centerLongitudeDegrees = if (planStartYawDegrees.isNaN()) {
+                        0f
+                    } else {
+                        planStartYawDegrees
+                    },
                     latitudeSpanDegrees = latitudeSpanDegrees,
                     centerLatitudeDegrees = 0f,
                 ) { stitchProgress.value = it }
@@ -895,8 +1055,9 @@ fun PhotoSphereCameraScreen(
             TargetOverlay(
                 orientation = { orientationState.value },
                 alignment = { alignment },
-                plan = plan,
-                activeIndex = activeIndex,
+                plan = run.plan,
+                activeIndex = run.activeIndex,
+                captured = capturedIndices,
                 fieldOfView = fieldOfView,
             )
 
@@ -905,7 +1066,7 @@ fun PhotoSphereCameraScreen(
                 modifier = Modifier.fillMaxSize(),
             )
 
-            if (showInstructions && activeIndex == 0 && bufferedFrames.isEmpty()) {
+            if (showInstructions && run.activeIndex == 0 && bufferedFrames.isEmpty()) {
                 CaptureInstructions(
                     onDismiss = { showInstructions = false },
                     modifier = Modifier.fillMaxSize(),
@@ -913,27 +1074,29 @@ fun PhotoSphereCameraScreen(
             }
 
             CaptureHud(
-                capturedCount = capturedTargets,
-                totalTargets = totalTargets,
-                completedRings = completedRings,
-                ringCount = ringCount,
+                capturedCount = run.capturedTargets,
+                totalTargets = run.totalTargets,
+                completedRings = run.completedRings,
+                ringCount = run.ringCount,
                 hint = captureHint(
                     isSensorAvailable = tracker.isSensorAvailable,
                     isCameraReady = imageCapture != null,
-                    hasPlan = plan != null,
-                    isComplete = isComplete,
+                    hasPlan = run.plan != null,
+                    isComplete = run.isComplete,
                     isHolding = isHolding,
                     accuracy = accuracy,
-                    completedRings = completedRings,
-                    ringCount = ringCount,
+                    completedRings = run.completedRings,
+                    ringCount = run.ringCount,
                 ),
                 lockBadge = lockBadge,
-                isComplete = isComplete,
+                isComplete = run.isComplete,
                 captureScope = captureScope,
                 // A mode change would renumber the targets already-shot frames
                 // were aimed at, so the choice is made before the first frame.
                 canChangeScope = bufferedFrames.isEmpty() && stitchJob == null,
                 onScopeChange = { captureScope = it },
+                guidanceEnabled = guidanceEnabled,
+                onToggleGuidance = { guidanceEnabled = !guidanceEnabled },
                 // Three overlapping frames are already a panorama. Whether one
                 // is worth keeping is the user's call, made on the result
                 // screen; the button's job is not to stand between them and it.
@@ -941,20 +1104,31 @@ fun PhotoSphereCameraScreen(
                     stitchJob == null,
                 onFinish = { startStitch() },
                 onRestart = {
-                    resetGuidance()
-                    scope.launch { buffer.cancelSession() }
+                    scope.launch {
+                        resetGuidance()
+                        buffer.cancelSession()
+                    }
                 },
                 // A blurred frame, or one shot while something moved through the
                 // scene: undoing pops it off the buffer and puts its target back
                 // on the reticle so it can simply be shot again.
                 canUndo = bufferedFrames.isNotEmpty() && stitchJob == null,
+                // Inert while a shutter is in flight: that frame is not in the
+                // buffer yet, so an undo would drop the one before it and then
+                // be overwritten when the capture advances the run. The
+                // coordinator refuses it regardless — dimming is what makes the
+                // refusal visible rather than a tap that does nothing. It stays
+                // on screen rather than disappearing, because a control that
+                // vanished on every one of thirty-odd captures would read as a
+                // glitch.
+                undoEnabled = !run.isCapturing,
                 onUndo = {
                     scope.launch {
-                        val undone = buffer.undoLastFrame() ?: return@launch
-                        activeIndex = undone.index
-                        isHolding = false
-                        alignment = AlignmentState()
-                        gate.reset()
+                        val undone = coordinator.undo { buffer.undoLastFrame()?.index }
+                        if (undone) {
+                            isHolding = false
+                            alignment = AlignmentState()
+                        }
                     }
                 },
                 // Debug A/B for the lens model; hidden in release builds.
@@ -970,6 +1144,85 @@ fun PhotoSphereCameraScreen(
                     .fillMaxSize()
                     .padding(insets),
             )
+
+            // Nothing bound: no preview under it and no targets to guide toward,
+            // so this covers the screen rather than sitting alongside a HUD that
+            // has nothing to report.
+            cameraError?.let { message ->
+                CameraErrorCard(
+                    message = message,
+                    onRetry = { bindAttempt++ },
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(insets),
+                )
+            }
+        }
+    }
+}
+
+/**
+ * What the screen shows when the camera will not start.
+ *
+ * A bind fails for reasons that pass — another app holding the camera, a
+ * provider that had not finished starting, a lens the device withdrew — so the
+ * failure is worth stating and worth offering a second go at. Without this the
+ * screen keeps a live-looking viewfinder over a camera that never bound, and
+ * the only way out is to kill the app.
+ */
+@Composable
+private fun CameraErrorCard(
+    message: String,
+    onRetry: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Box(
+        modifier = modifier.background(ChromeScrim),
+        contentAlignment = Alignment.Center,
+    ) {
+        Surface(
+            modifier = Modifier.padding(horizontal = 28.dp),
+            shape = MaterialTheme.shapes.extraLarge,
+            color = SphereSurface,
+            tonalElevation = 6.dp,
+            shadowElevation = 20.dp,
+        ) {
+            Column(
+                modifier = Modifier.padding(24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(14.dp),
+            ) {
+                Text(
+                    text = stringResource(R.string.capture_camera_unavailable),
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = SphereOnSurface,
+                    textAlign = TextAlign.Center,
+                )
+                Text(
+                    text = message,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = SphereOnSurfaceVariant,
+                    textAlign = TextAlign.Center,
+                )
+                Button(
+                    onClick = onRetry,
+                    shape = PillShape,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = SphereAccent,
+                        contentColor = Color.Black,
+                    ),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(50.dp),
+                ) {
+                    Text(
+                        text = stringResource(R.string.capture_camera_retry),
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                }
+            }
         }
     }
 }
@@ -995,10 +1248,13 @@ private fun CaptureHud(
     onFinish: () -> Unit,
     onRestart: () -> Unit,
     canUndo: Boolean,
+    undoEnabled: Boolean,
     onUndo: () -> Unit,
     captureScope: SphereCaptureScope,
     canChangeScope: Boolean,
     onScopeChange: (SphereCaptureScope) -> Unit,
+    guidanceEnabled: Boolean,
+    onToggleGuidance: () -> Unit,
     distortionEnabled: Boolean,
     onToggleDistortion: () -> Unit,
     refinementEnabled: Boolean,
@@ -1009,7 +1265,14 @@ private fun CaptureHud(
     onToggleColorFrames: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    Box(modifier = modifier) {
+    BoxWithConstraints(modifier = modifier) {
+        // A sideways screen (Android 16 force-rotating a tablet past the
+        // portrait lock) cannot stack the chrome top and bottom — the bottom
+        // column would cover the middle of the viewfinder, which is where the
+        // user is aiming. The controls move to the right edge instead, and the
+        // finishes stay reachable because the stack is tall, not wide.
+        val isLandscape = maxWidth > maxHeight
+
         // Soft gradient washes top and bottom, so the chrome stays legible
         // whatever the lens is pointed at. Both ends need one: the guidance line
         // and the finish button sit over live scene just as the progress pill
@@ -1019,15 +1282,26 @@ private fun CaptureHud(
             modifier = Modifier
                 .align(Alignment.TopCenter)
                 .fillMaxWidth()
-                .height(200.dp)
+                .height(if (isLandscape) 120.dp else 200.dp)
                 .background(Brush.verticalGradient(listOf(ChromeScrim, Color.Transparent))),
         )
         Box(
             modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .fillMaxWidth()
-                .height(260.dp)
-                .background(Brush.verticalGradient(listOf(Color.Transparent, ChromeScrim))),
+                .align(if (isLandscape) Alignment.CenterEnd else Alignment.BottomCenter)
+                .then(
+                    if (isLandscape) {
+                        Modifier.fillMaxHeight().width(120.dp)
+                    } else {
+                        Modifier.fillMaxWidth().height(260.dp)
+                    }
+                )
+                .background(
+                    if (isLandscape) {
+                        Brush.horizontalGradient(listOf(Color.Transparent, ChromeScrim))
+                    } else {
+                        Brush.verticalGradient(listOf(Color.Transparent, ChromeScrim))
+                    }
+                ),
         )
 
         // The StreetView-style undo: drop the last shot and put its target back
@@ -1040,7 +1314,41 @@ private fun CaptureHud(
                 .align(Alignment.TopStart)
                 .padding(start = 20.dp, top = 22.dp),
         ) {
-            UndoButton(onUndo = onUndo)
+            UndoButton(onUndo = onUndo, enabled = undoEnabled)
+        }
+
+        // The sound-guidance toggle: beeps, dwell haptics and spoken target
+        // cues for driving capture without sight. Sits top-right, clear of the
+        // undo button on the other side of the pill.
+        Surface(
+            modifier = Modifier
+                .align(Alignment.TopEnd)
+                .padding(end = 20.dp, top = 22.dp),
+            shape = CircleShape,
+            color = if (guidanceEnabled) {
+                SphereAccent.copy(alpha = 0.9f)
+            } else {
+                GlassSurface
+            },
+            shadowElevation = 8.dp,
+        ) {
+            IconButton(onClick = onToggleGuidance) {
+                Icon(
+                    imageVector = if (guidanceEnabled) {
+                        Icons.Filled.VolumeUp
+                    } else {
+                        Icons.Filled.VolumeOff
+                    },
+                    contentDescription = stringResource(
+                        if (guidanceEnabled) {
+                            R.string.guidance_toggle_hide
+                        } else {
+                            R.string.guidance_toggle_show
+                        }
+                    ),
+                    tint = if (guidanceEnabled) Color.Black else GlassContent,
+                )
+            }
         }
 
         Column(
@@ -1069,8 +1377,16 @@ private fun CaptureHud(
 
         Column(
             modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .fillMaxWidth()
+                .align(if (isLandscape) Alignment.CenterEnd else Alignment.BottomCenter)
+                .then(
+                    if (isLandscape) {
+                        // A capped width so the finish button stays thumb-sized
+                        // instead of stretching across half a tablet.
+                        Modifier.fillMaxHeight().widthIn(max = 360.dp)
+                    } else {
+                        Modifier.fillMaxWidth()
+                    }
+                )
                 .padding(horizontal = 24.dp, vertical = 26.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(14.dp),
@@ -1241,9 +1557,19 @@ private fun CaptureProgressPill(
     // "12", "/ 48", "frames", a bare progress bar and then "1 of 3 bands" as
     // five unrelated announcements — the one number that matters during a
     // capture, arriving as rubble.
-    val spoken = stringResource(R.string.capture_progress_description, capturedCount, totalTargets)
+    val spoken = pluralStringResource(
+        R.plurals.capture_progress_description,
+        capturedCount,
+        capturedCount,
+        totalTargets,
+    )
     val spokenWithBands = if (ringCount > 1) {
-        spoken + ", " + stringResource(R.string.capture_rings, completedRings, ringCount)
+        spoken + ", " + pluralStringResource(
+            R.plurals.capture_rings,
+            completedRings,
+            completedRings,
+            ringCount,
+        )
     } else {
         spoken
     }
@@ -1287,7 +1613,10 @@ private fun CaptureProgressPill(
                     modifier = Modifier.padding(bottom = 4.dp),
                 )
                 Text(
-                    text = stringResource(R.string.capture_progress_frames),
+                    text = pluralStringResource(
+                        R.plurals.capture_progress_frames,
+                        capturedCount,
+                    ),
                     style = MaterialTheme.typography.labelSmall,
                     color = GlassContentDim,
                     modifier = Modifier.padding(bottom = 5.dp),
@@ -1309,7 +1638,12 @@ private fun CaptureProgressPill(
             }
             if (ringCount > 1) {
                 Text(
-                    text = stringResource(R.string.capture_rings, completedRings, ringCount),
+                    text = pluralStringResource(
+                        R.plurals.capture_rings,
+                        completedRings,
+                        completedRings,
+                        ringCount,
+                    ),
                     style = MaterialTheme.typography.labelSmall,
                     color = GlassContentDim,
                     modifier = Modifier.padding(top = 7.dp),
@@ -1323,23 +1657,28 @@ private fun CaptureProgressPill(
  * The StreetView-style "undo that shot" control: a small glass button that
  * drops the most recently captured frame and puts its target back on the
  * reticle. Only appears once there is something to undo.
+ *
+ * Dimmed and inert while a shutter is in flight — the frame being written is
+ * not in the buffer yet, so there is a moment where "the last shot" is not the
+ * one the user means.
  */
 @Composable
 private fun UndoButton(
     onUndo: () -> Unit,
     modifier: Modifier = Modifier,
+    enabled: Boolean = true,
 ) {
     Surface(
         modifier = modifier,
         shape = CircleShape,
-        color = GlassSurface,
+        color = if (enabled) GlassSurface else GlassSurfaceDim,
         shadowElevation = 8.dp,
     ) {
-        IconButton(onClick = onUndo) {
+        IconButton(onClick = onUndo, enabled = enabled) {
             Icon(
                 imageVector = Icons.AutoMirrored.Filled.Undo,
                 contentDescription = stringResource(R.string.capture_undo),
-                tint = GlassContent,
+                tint = if (enabled) GlassContent else GlassContentDim,
             )
         }
     }
@@ -1711,8 +2050,7 @@ private fun Context.stitchFailureMessage(error: Throwable): String {
 
 /** Picks the single most useful thing to tell the user right now. */
 @Composable
-private fun captureHint(
-    isSensorAvailable: Boolean,
+private fun captureHint(    isSensorAvailable: Boolean,
     isCameraReady: Boolean,
     hasPlan: Boolean,
     isComplete: Boolean,
@@ -1758,17 +2096,17 @@ private fun stitchDiagnostics(
     refinementApplied: Boolean,
     seamsApplied: Boolean,
 ): String {
-    val poses = frames.joinToString(separator = "\n") { frame ->
+    val poses = frames.mapIndexed { index, frame ->
         val exif = runCatching {
             ExifInterface(frame.file).getAttributeInt(
                 ExifInterface.TAG_ORIENTATION,
                 ExifInterface.ORIENTATION_NORMAL,
             )
         }.getOrDefault(ExifInterface.ORIENTATION_NORMAL)
-        "  #${frames.indexOf(frame)} yaw ${frame.pose.yawDegrees.roundToInt()}° " +
+        "  #$index yaw ${frame.pose.yawDegrees.roundToInt()}° " +
             "pitch ${frame.pose.pitchDegrees.roundToInt()}° roll ${frame.pose.rollDegrees.roundToInt()}°" +
             " exif=$exif"
-    }
+    }.joinToString(separator = "\n")
     val device = listOfNotNull(
         Build.MANUFACTURER,
         Build.MODEL,
@@ -1804,7 +2142,8 @@ private suspend fun ImageCapture.saveFrame(
     context: Context,
     buffer: ImageBufferManager,
     index: Int,
-    orientation: OrientationData,
+    dwellOrientation: OrientationData,
+    currentOrientation: () -> OrientationData,
     burstPerTarget: Int,
 ): Result<File> {
     val requests = try {
@@ -1818,16 +2157,27 @@ private suspend fun ImageCapture.saveFrame(
     }
 
     return try {
-        requests.forEach { takePictureTo(context, it.outputOptions) }
+        // Each shot keeps the attitude the phone had at *its* shutter. A burst
+        // of max-quality stills takes seconds, and the dwell mean describes
+        // only the moment before the first one: a hand that eases off after
+        // the first flash would otherwise put the second or third shot on the
+        // sphere where the first was aimed — a misplaced frame no blend hides.
+        val shotOrientations = requests.map { request ->
+            var atShutter: OrientationData? = null
+            takePictureTo(context, request.outputOptions) {
+                atShutter = currentOrientation()
+            }
+            shotPose(dwellOrientation, atShutter ?: currentOrientation())
+        }
 
-        val best = if (burstPerTarget > 1) {
+        val bestIndex = if (burstPerTarget > 1) {
             // Scoring decodes each candidate, which is cheap next to the captures
             // that just ran but is still real work — keep it off the main thread.
             withContext(Dispatchers.Default) {
-                SharpnessSelection.pickSharpest(requests.map { it.file })
+                SharpnessSelection.sharpestIndex(requests.map { it.file })
             }
         } else {
-            requests.first().file
+            0
         }
 
         // A null commit means the frame belonged to a session that has since
@@ -1835,26 +2185,34 @@ private suspend fun ImageCapture.saveFrame(
         // dropped with its file. Reporting it as success would advance the
         // plan past a target that was never captured, leaving a hole in the
         // sphere; the failure path leaves the index in place for a retry.
-        val committed = buffer.commitBestFrame(best, index, orientation)
-            ?: return Result.failure(
-                IllegalStateException("session superseded, frame not captured")
-            )
+        val committed = buffer.commitBestFrame(
+            requests[bestIndex].file,
+            index,
+            shotOrientations[bestIndex],
+        )
+            ?: return Result.failure(SessionSupersededException())
         Result.success(committed.file)
     } catch (e: CancellationException) {
         // Leaving the screen mid-shutter is not a capture failure; let the
-        // cancellation travel rather than reporting it to the user.
+        // cancellation travel rather than reporting it to the user. The
+        // reserved candidates still need clearing — a cancelled burst would
+        // otherwise litter the session directory until the next prune.
+        withContext(NonCancellable + Dispatchers.IO) { deleteReserved(requests) }
         throw e
     } catch (e: Exception) {
         // Half a burst written, none of it buffered: clear the candidates so the
         // session directory does not accumulate rejected frames.
-        withContext(NonCancellable + Dispatchers.IO) {
-            requests.forEach { request ->
-                if (request.file.exists() && !request.file.delete()) {
-                    Log.w(TAG, "Could not delete failed burst file ${request.file.name}")
-                }
-            }
-        }
+        withContext(NonCancellable + Dispatchers.IO) { deleteReserved(requests) }
         Result.failure(e)
+    }
+}
+
+/** Deletes the reserved files of a burst that never committed. */
+private suspend fun deleteReserved(requests: List<SphereImageStore.TempFrameRequest>) {
+    requests.forEach { request ->
+        if (request.file.exists() && !request.file.delete()) {
+            Log.w(TAG, "Could not delete failed burst file ${request.file.name}")
+        }
     }
 }
 
@@ -1897,15 +2255,50 @@ private suspend fun Camera.focusAt(
     return true
 }
 
-/** Suspending [ImageCapture.takePicture]; the callback form fits nothing here. */
+/**
+ * How far (in degrees of rotation) a shot may sit from its dwell's mean pose and
+ * still be stamped with that mean.
+ *
+ * Inside it, the shot is where the dwell said it was, and the mean of twenty
+ * samples is a quieter estimate than the one sample at the shutter. Past it the
+ * phone has genuinely moved, and the shutter's own sample is the only honest
+ * answer.
+ */
+private const val SHOT_POSE_TOLERANCE_DEGREES = 0.4
+
+/** The pose to stamp on a shot: see [SHOT_POSE_TOLERANCE_DEGREES]. */
+private fun shotPose(dwell: OrientationData, atShutter: OrientationData): OrientationData {
+    if (!atShutter.hasFix) return dwell
+    val a = dwell.cameraBasis ?: return atShutter
+    val b = atShutter.cameraBasis ?: return atShutter
+    // The angle of the relative rotation aᵀb, from its trace — which is just
+    // the element-wise dot product of the two matrices.
+    var trace = 0.0
+    for (i in 0 until 9) trace += a[i].toDouble() * b[i]
+    val cosAngle = ((trace - 1.0) / 2.0).coerceIn(-1.0, 1.0)
+    val degrees = Math.toDegrees(acos(cosAngle))
+    return if (degrees <= SHOT_POSE_TOLERANCE_DEGREES) dwell else atShutter
+}
+
+/**
+ * Suspending [ImageCapture.takePicture]; the callback form fits nothing here.
+ *
+ * [onCaptureStarted] runs on the main thread at the moment the sensor begins
+ * the exposure — the instant whose attitude the frame records.
+ */
 private suspend fun ImageCapture.takePictureTo(
     context: Context,
     outputOptions: ImageCapture.OutputFileOptions,
+    onCaptureStarted: () -> Unit = {},
 ): ImageCapture.OutputFileResults = suspendCancellableCoroutine { continuation ->
     takePicture(
         outputOptions,
         ContextCompat.getMainExecutor(context),
         object : ImageCapture.OnImageSavedCallback {
+            override fun onCaptureStarted() {
+                onCaptureStarted()
+            }
+
             override fun onImageSaved(output: ImageCapture.OutputFileResults) {
                 continuation.resume(output)
             }
@@ -1958,3 +2351,26 @@ private suspend fun Context.awaitCameraProvider(): ProcessCameraProvider =
             ContextCompat.getMainExecutor(this),
         )
     }
+
+/** True when a screen reader (TalkBack and friends) is active. */
+private fun Context.isScreenReaderActive(): Boolean = runCatching {
+    Settings.Secure.getInt(contentResolver, Settings.Secure.ACCESSIBILITY_ENABLED, 0) == 1
+}.getOrDefault(false)
+
+/** "behind you, above you, to your left" — the spoken direction of a target. */
+private fun Context.targetPhrase(relation: TargetRelation): String {
+    val parts = buildList {
+        if (relation.isBehind) add(getString(R.string.guidance_behind))
+        when (relation.vertical) {
+            TargetRelation.Vertical.Above -> add(getString(R.string.guidance_above))
+            TargetRelation.Vertical.Below -> add(getString(R.string.guidance_below))
+            TargetRelation.Vertical.Level -> {}
+        }
+        when (relation.horizontal) {
+            TargetRelation.Horizontal.Left -> add(getString(R.string.guidance_left))
+            TargetRelation.Horizontal.Right -> add(getString(R.string.guidance_right))
+            TargetRelation.Horizontal.Centre -> {}
+        }
+    }
+    return parts.joinToString(", ")
+}

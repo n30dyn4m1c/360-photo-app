@@ -36,8 +36,10 @@ private const val SENSOR_THREAD_NAME = "orientation-sensor"
  * [OrientationReference.Camera] frame, and the phone held upright with the rear
  * camera aimed at the horizon:
  *
- * - [yawDegrees] is the compass bearing the **camera** points at: 0° = magnetic
- *   north, +90° = east, ±180° = south, -90° = west.
+ * - [yawDegrees] is the bearing the **camera** points at, growing clockwise
+ *   seen from above. With the game rotation vector (the default source) 0° is
+ *   an arbitrary but fixed heading, not north; see
+ *   [OrientationTracker.rotationVectorSensor].
  * - [pitchDegrees] is 0° at the horizon and goes **negative as the camera aims
  *   upward** (-90° = straight up, +90° = straight down at your feet).
  * - [rollDegrees] is 0° when the display's up axis points at the sky, and turns
@@ -149,13 +151,14 @@ enum class OrientationReference {
 }
 
 /**
- * Tracks device attitude from [Sensor.TYPE_ROTATION_VECTOR] and publishes it as
- * a [StateFlow] of [OrientationData].
+ * Tracks device attitude from [Sensor.TYPE_GAME_ROTATION_VECTOR] (falling back
+ * to [Sensor.TYPE_ROTATION_VECTOR]) and publishes it as a [StateFlow] of
+ * [OrientationData].
  *
- * The rotation vector is a *fused* sensor (gyroscope + accelerometer +
- * magnetometer), so it gives an absolute, north-referenced attitude with no
- * drift and no manual filtering — the right input for stitching frames into a
- * sphere.
+ * Both are *fused* sensors, so the attitude needs no manual filtering. The
+ * game vector leaves the magnetometer out, so its yaw is relative to an
+ * arbitrary start rather than to north — which is all a sphere needs, and far
+ * steadier indoors. See [rotationVectorSensor].
  *
  * Events are delivered on a private background thread, so a high sampling rate
  * never competes with the UI. [orientation] is a `StateFlow`, which is safe to
@@ -189,8 +192,35 @@ class OrientationTracker(
     private val sensorManager: SensorManager? =
         context.applicationContext.getSystemService(SensorManager::class.java)
 
+    /**
+     * The attitude source: the *game* rotation vector (gyroscope +
+     * accelerometer, no magnetometer) when the device has one, the full
+     * rotation vector otherwise.
+     *
+     * The game vector is what Street View and Google Camera's Photo Sphere
+     * track with, and for the same reason: a sphere needs the aim to be
+     * consistent *between frames*, never an absolute bearing — the plan is
+     * anchored on whichever way the user faces at the start. The magnetometer
+     * is the one input that can make a still phone's heading jump by degrees
+     * (a steel beam, a laptop, rebar in the floor), and every such jump is a
+     * frame placed off its target. The gyro-only fusion trades that for a
+     * slow drift of a fraction of a degree per minute, which a capture of a
+     * couple of minutes absorbs in its overlap.
+     */
     private val rotationVectorSensor: Sensor? =
-        sensorManager?.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
+        sensorManager?.getDefaultSensor(Sensor.TYPE_GAME_ROTATION_VECTOR)
+            ?: sensorManager?.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
+
+    /** The sensor type events are accepted from; see [rotationVectorSensor]. */
+    private val sensorType: Int = rotationVectorSensor?.type ?: Sensor.TYPE_ROTATION_VECTOR
+
+    /**
+     * Whether the attitude is gyro-only. Its accuracy field describes no
+     * compass, so it is never published: a HAL that reports the game vector
+     * as "unreliable" would otherwise hold the shutter for a calibration the
+     * sensor does not use.
+     */
+    private val isMagnetometerFree: Boolean = sensorType == Sensor.TYPE_GAME_ROTATION_VECTOR
 
     /**
      * False on devices without a fused rotation vector (no gyroscope, or a
@@ -288,7 +318,7 @@ class OrientationTracker(
     }
 
     override fun onSensorChanged(event: SensorEvent) {
-        if (event.sensor.type != Sensor.TYPE_ROTATION_VECTOR) return
+        if (event.sensor.type != sensorType) return
 
         val raw = event.values
         // A rotation vector is three elements plus an optional scalar; anything
@@ -363,6 +393,7 @@ class OrientationTracker(
      * phone whose sensor is working perfectly well.
      */
     private fun accuracyOf(event: SensorEvent): OrientationAccuracy {
+        if (isMagnetometerFree) return OrientationAccuracy.Unknown
         val reported = accuracy
         if (reported != OrientationAccuracy.Unknown) return reported
         val fromEvent = OrientationAccuracy.fromSensorAccuracy(event.accuracy)
@@ -402,7 +433,7 @@ class OrientationTracker(
     }
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {
-        if (sensor?.type != Sensor.TYPE_ROTATION_VECTOR) return
+        if (sensor?.type != sensorType || isMagnetometerFree) return
         val mapped = OrientationAccuracy.fromSensorAccuracy(accuracy)
         this.accuracy = mapped
         // Surface a calibration warning immediately rather than at the next event.
