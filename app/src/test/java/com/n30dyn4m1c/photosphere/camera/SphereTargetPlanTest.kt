@@ -251,20 +251,34 @@ class SphereTargetPlanTest {
     }
 
     @Test
-    fun `a ring counts as complete only once its last target is shot`() {
+    fun `a ring counts as complete only once every target on it is shot`() {
         val plan = SphereTargetPlan.createForFieldOfView(
             startYawDegrees = 0f,
             fieldOfView = FieldOfView(horizontalDegrees = 52f, verticalDegrees = 66f),
         )
         val firstRing = plan.rings.first()
 
-        // One short of the ring's last target is still no complete ring.
-        assertEquals(0, plan.completedRings(firstRing.last))
-        assertEquals(1, plan.completedRings(firstRing.last + 1))
+        // One short of the ring is still no complete ring.
+        assertEquals(0, plan.completedRings((firstRing.first until firstRing.last).toSet()))
+        assertEquals(1, plan.completedRings(firstRing.toSet()))
+
+        // Order does not matter: a ring shot back to front is just as closed,
+        // and a ring missing its *first* target is just as open.
+        assertEquals(1, plan.completedRings(firstRing.reversed().toSet()))
+        assertEquals(0, plan.completedRings((firstRing.first + 1..firstRing.last).toSet()))
 
         // Nothing captured is no rings, whatever the plan looks like.
-        assertEquals(0, plan.completedRings(0))
-        assertEquals(plan.ringCount, plan.completedRings(plan.size))
+        assertEquals(0, plan.completedRings(emptySet()))
+        assertEquals(plan.ringCount, plan.completedRings(plan.targets.indices.toSet()))
+    }
+
+    @Test
+    fun `adaptive rings go horizon, up, then down`() {
+        val elevations = SphereTargetPlan.adaptiveRingElevations(59f, 0.35f)
+        assertEquals(0f, elevations.first())
+        val firstDown = elevations.indexOfFirst { it < 0f }
+        assertTrue(elevations.drop(1).take(firstDown - 1).all { it > 0f })
+        assertTrue(elevations.drop(firstDown).all { it < 0f })
     }
 
     /** Great-circle angle between two targets, for checking coverage. */

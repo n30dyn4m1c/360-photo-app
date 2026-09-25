@@ -62,11 +62,19 @@ internal object RotationMath {
 
     /** Geodesic distance between two rotations, in radians. */
     fun angle(a: DoubleArray, b: DoubleArray): Double {
-        var trace = 0.0
-        for (i in 0..2) {
-            for (j in 0..2) trace += a[i * 3 + j] * b[i * 3 + j]
-        }
-        return acos(((trace - 1.0) / 2.0).coerceIn(-1.0, 1.0))
+        val relative = multiply(transpose(a), b)
+        // The cosine from the trace, and the sine from the skew part of the
+        // relative rotation. `acos` alone would amplify the last bits of
+        // roundoff in the trace into a phantom angle when the rotations are
+        // nearly identical (the trace sum is only exact to a few ulps, and
+        // d(acos)/dx diverges at x = 1) — with atan2(sin, cos) an identical
+        // pair reports exactly 0 and a close pair is exact to first order.
+        val cos = ((relative[0] + relative[4] + relative[8] - 1.0) / 2.0).coerceIn(-1.0, 1.0)
+        val s1 = relative[7] - relative[5]
+        val s2 = relative[2] - relative[6]
+        val s3 = relative[3] - relative[1]
+        val sin = 0.5 * sqrt(s1 * s1 + s2 * s2 + s3 * s3)
+        return atan2(sin, cos)
     }
 
     /** The rotation taking [from] to [to], both unit vectors. */
@@ -286,6 +294,109 @@ internal object RotationMath {
             }
         }
         return current
+    }
+
+    /**
+     * One matched feature correspondence used to estimate focal corrections.
+     *
+     * The two unit bearings [transformedFrom] and [toBearing] should agree: the
+     * first is the *from* frame's bearing rotated into the *to* frame by the
+     * edge's measured rotation, so the residual is simply their difference. Each
+     * carries the derivative of its bearing with respect to the log-scale of its
+     * own frame's focal length — [transformedFromDerivative] is the derivative
+     * of the already-rotated bearing — which is what turns the residual into a
+     * linear least-squares problem in the per-frame corrections.
+     */
+    data class FocalCorrespondence(
+        val from: Int,
+        val to: Int,
+        val transformedFrom: DoubleArray,
+        val toBearing: DoubleArray,
+        val transformedFromDerivative: DoubleArray,
+        val toDerivative: DoubleArray,
+    )
+
+    /**
+     * Least-squares per-frame focal corrections from matched correspondences.
+     *
+     * A focal-length error shows up as a systematic angular error between
+     * matched bearings: the pixels were projected through the wrong focal
+     * length, so the unit bearings recovered from them are pulled toward or
+     * away from the optical axis. For a small log-scale correction `δ` per
+     * frame, each correspondence's residual
+     *
+     *   r(δ_from, δ_to) = R·p_from(e^δ_from) − p_to(e^δ_to)
+     *
+     * is linearised with the derivative vectors the correspondence carries, and
+     * the resulting normal equations are solved by Gauss–Seidel over the frames
+     * — the same style [averageRotations] uses for the rotations.
+     *
+     * [anchorFrame] stays at zero. Rotation averaging already fixes that frame
+     * so the result keeps the user's reference frame, and pinning its focal
+     * length removes the one remaining gauge: the whole sphere may be scaled by
+     * a constant without changing any alignment, so the absolute scale is only
+     * defined relative to a frame that is held still. Corrections are clamped
+     * to ±[maxCorrection] (about ±16% of the focal length) each sweep, so a
+     * degenerate or poorly-conditioned solve can never bend a frame out of
+     * shape; frames the correspondences never touch simply keep their reported
+     * focal length.
+     *
+     * Returns one log-scale per frame (zero for the anchor); the caller applies
+     * `e^δ` to the frame's focal lengths.
+     */
+    fun refineFocalLengths(
+        correspondences: List<FocalCorrespondence>,
+        frameCount: Int,
+        iterations: Int = 8,
+        maxCorrection: Double = 0.15,
+        anchorFrame: Int = 0,
+    ): DoubleArray {
+        val delta = DoubleArray(frameCount)
+        if (correspondences.isEmpty() || frameCount < 2) return delta
+
+        val hessian = Array(frameCount) { DoubleArray(frameCount) }
+        val gradient = DoubleArray(frameCount)
+        for (correspondence in correspondences) {
+            val from = correspondence.from
+            val to = correspondence.to
+            if (from !in 0 until frameCount || to !in 0 until frameCount) continue
+            // r = r₀ + δ_from·d_from − δ_to·d_to, so the Hessian block for the
+            // pair carries the cross term negative and the gradient of the
+            // *to* frame changes sign against the *from* one.
+            val residual = sub3(correspondence.transformedFrom, correspondence.toBearing)
+            val dFrom = correspondence.transformedFromDerivative
+            val dTo = correspondence.toDerivative
+            hessian[from][from] += dot3(dFrom, dFrom)
+            hessian[to][to] += dot3(dTo, dTo)
+            hessian[from][to] -= dot3(dFrom, dTo)
+            hessian[to][from] = hessian[from][to]
+            gradient[from] -= dot3(dFrom, residual)
+            gradient[to] += dot3(dTo, residual)
+        }
+
+        // Gauss–Seidel over the frames; the anchor is skipped so its delta
+        // stays zero. The deltas carry over between sweeps, which is a warm
+        // start rather than a bug: each pass refines the previous estimate.
+        repeat(iterations) {
+            for (frame in 0 until frameCount) {
+                if (frame == anchorFrame) continue
+                var estimate = gradient[frame]
+                for (neighbour in 0 until frameCount) {
+                    if (neighbour != frame) estimate -= hessian[frame][neighbour] * delta[neighbour]
+                }
+                val diagonal = hessian[frame][frame]
+                delta[frame] = if (diagonal > 1e-9) {
+                    (estimate / diagonal).coerceIn(-maxCorrection, maxCorrection)
+                } else {
+                    0.0
+                }
+            }
+        }
+
+        for (frame in 0 until frameCount) {
+            if (!delta[frame].isFinite()) delta[frame] = 0.0
+        }
+        return delta
     }
 
     /**

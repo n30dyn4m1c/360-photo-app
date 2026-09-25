@@ -22,6 +22,17 @@ data class CameraPose(
     val yawDegrees: Float,
     val pitchDegrees: Float,
     val rollDegrees: Float,
+    /**
+     * The camera's basis as a rotation matrix, when the pose was measured as
+     * one — in the [CameraBasis.toRotationMatrix] layout (the `[right, −up,
+     * forward]` columns in the world frame). The sensor layer provides it for
+     * every captured frame: the dwell is averaged as *rotations*, because the
+     * Euler components collapse into each other at the zenith (pitch ±90°),
+     * where yaw alone cannot say which way is up in the frame.
+     * [CameraBasis.of] prefers it when present; the angles are kept for EXIF,
+     * diagnostics and the viewfinder.
+     */
+    val matrix: DoubleArray? = null,
 ) {
     /** Height above the horizon, positive up. */
     val elevationDegrees: Float get() = -pitchDegrees
@@ -35,7 +46,8 @@ data class CameraPose(
  * and evaluates it against millions of directions — the components are held as
  * flat doubles so the projection loop allocates nothing.
  *
- * The three vectors are orthonormal and right-handed: `right × up = forward`.
+ * The three vectors are orthonormal and left-handed: `up = right × forward`,
+ * so `right × up = −forward`.
  */
 class CameraBasis private constructor(
     val forwardX: Double,
@@ -73,15 +85,22 @@ class CameraBasis private constructor(
     )
 
     /**
-     * This basis as a row-major 3×3 rotation matrix mapping camera axes to the
-     * world frame. The columns are `[right, up, forward]` — `toWorld` is exactly
-     * the matrix times the camera-space vector. Exchanged with pose refinement,
-     * which works in rotation matrices.
+     * This basis as a row-major 3×3 rotation matrix.
+     *
+     * The camera's own (right, up, forward) triple is left-handed — `up` is
+     * built as `right × forward` — so those columns would form a reflection,
+     * and the rotation algebra downstream (quaternion means, pose refinement)
+     * assumes proper rotations: an improper matrix smuggles a 90° rotation
+     * through the quaternion conversion. The exchange format therefore mirrors
+     * the up axis: the columns are `[right, −up, forward]`, the right-handed
+     * counterpart of the camera frame. [fromRotationMatrix] is the exact
+     * inverse, and the sensor layer writes the same layout in
+     * `cameraBasisMatrix`.
      */
     fun toRotationMatrix(): DoubleArray = doubleArrayOf(
-        rightX, upX, forwardX,
-        rightY, upY, forwardY,
-        rightZ, upZ, forwardZ,
+        rightX, -upX, forwardX,
+        rightY, -upY, forwardY,
+        rightZ, -upZ, forwardZ,
     )
 
     /** The [yawDegrees]/[pitchDegrees]/[rollDegrees] this basis was built from. */
@@ -118,6 +137,12 @@ class CameraBasis private constructor(
          * Rodrigues' formula collapses to a plain rotation within their plane.
          */
         fun of(pose: CameraPose): CameraBasis {
+            // A measured basis is exact where the angles are not: the sensor
+            // averaged the dwell as a rotation, and at the zenith the angles
+            // alone cannot say which way is up in the frame. It wins when
+            // present.
+            pose.matrix?.let { return fromRotationMatrix(it) }
+
             val yaw = Math.toRadians(pose.yawDegrees.toDouble())
             val elevation = Math.toRadians(pose.elevationDegrees.toDouble())
             val roll = Math.toRadians(pose.rollDegrees.toDouble())
@@ -158,18 +183,20 @@ class CameraBasis private constructor(
          * right-handed, as the refinement pipeline produces.
          *
          * The vectors live in the matrix's *columns*, matching [toRotationMatrix]:
-         * the storage is `[right, up, forward]` laid out one component-row at a
-         * time, so a column is read at stride 3. Reading the rows instead would
-         * transpose the basis — which for a level frame collapses every forward
-         * onto due north and stacks all the frames of a capture on one longitude.
+         * the storage is `[right, −up, forward]` laid out one component-row at a
+         * time, so a column is read at stride 3 — and the up column is mirrored
+         * back to the camera's own left-handed triple. Reading the rows instead
+         * would transpose the basis — which for a level frame collapses every
+         * forward onto due north and stacks all the frames of a capture on one
+         * longitude.
          */
         fun fromRotationMatrix(matrix: DoubleArray): CameraBasis = CameraBasis(
             rightX = matrix[0],
             rightY = matrix[3],
             rightZ = matrix[6],
-            upX = matrix[1],
-            upY = matrix[4],
-            upZ = matrix[7],
+            upX = -matrix[1],
+            upY = -matrix[4],
+            upZ = -matrix[7],
             forwardX = matrix[2],
             forwardY = matrix[5],
             forwardZ = matrix[8],
@@ -217,6 +244,38 @@ data class FrameIntrinsics(
      * loosely-described lens makes them differ slightly.
      */
     val focalPx: Double get() = sqrt(focalXPx * focalYPx)
+
+    /**
+     * The same lens with its focal length multiplied by [focalScale].
+     *
+     * This is what pose refinement's focal correction hands down to the
+     * renderer: the per-frame scale that the feature correspondences said the
+     * reported field of view was off by. Both axes are scaled together, because
+     * the correction is a single scale on a single physical lens, and the
+     * radial coefficients are re-normalised against the *new* focal length —
+     * a pixel offset `p` is the focal-normalized offset `p / f`, so the
+     * polynomial in `r²` gains a factor `1 / f^(2·order)` per term
+     * (`k1` by `s²`, `k2` by `s⁴`, `k3` by `s⁶`). Without that the lens would
+     * be described by one focal length and corrected by another, which is
+     * exactly the inconsistency the refinement exists to remove.
+     */
+    fun scaledBy(focalScale: Double): FrameIntrinsics {
+        if (focalScale <= 0.0 || abs(focalScale - 1.0) < 1e-6) return this
+        val scaledRadial = radial?.let { coefficients ->
+            var divisor = focalScale * focalScale
+            val out = DoubleArray(coefficients.size)
+            for (index in coefficients.indices) {
+                out[index] = coefficients[index] / divisor
+                divisor *= focalScale * focalScale
+            }
+            out
+        }
+        return copy(
+            focalXPx = focalXPx * focalScale,
+            focalYPx = focalYPx * focalScale,
+            radial = scaledRadial,
+        )
+    }
 
     companion object {
         /**
@@ -700,9 +759,15 @@ internal fun wrapColumn(column: Int, width: Int): Int {
  * land within one field of view on both axes — the condition for two
  * axis-aligned field-of-view windows to intersect, since two frames each
  * reaching half a field of view either side of their aim meet exactly when
- * their aims are less than one full field of view apart. The returned value is
- * the squared angular separation (tangent-space), so a smaller value is a
- * stronger shared view, which is how the pose graph orders its edges.
+ * their aims are less than one full field of view apart. In tangent space that
+ * bound is `2·tan(fov/2)`: each window spans `tan(fov/2)` either side of its
+ * aim, and the windows touch when the aims are `2·tan(fov/2)` apart. (Not
+ * `tan(fov)` — the two only agree at small angles, and at a 52° field of view
+ * `tan(52°)` is ~31% looser than the true bound, admitting pairs whose frames
+ * do not actually overlap into the pose graph and the exposure tie.) The
+ * returned value is the squared angular separation (tangent-space), so a
+ * smaller value is a stronger shared view, which is how the pose graph orders
+ * its edges.
  */
 internal fun angularOverlap(
     a: CameraBasis,
@@ -714,17 +779,18 @@ internal fun angularOverlap(
     if (depth <= MIN_DEPTH) return null
     val horizontalSeparation = abs(a.lateralOf(b.forwardX, b.forwardY, b.forwardZ) / depth)
     val verticalSeparation = abs(a.verticalOf(b.forwardX, b.forwardY, b.forwardZ) / depth)
-    if (horizontalSeparation >= tanOf(horizontalFovDegrees)) return null
-    if (verticalSeparation >= tanOf(verticalFovDegrees)) return null
+    if (horizontalSeparation >= overlapBound(horizontalFovDegrees)) return null
+    if (verticalSeparation >= overlapBound(verticalFovDegrees)) return null
     return horizontalSeparation * horizontalSeparation + verticalSeparation * verticalSeparation
 }
 
 /**
- * `tan(degrees)`, saturating at a right angle.
+ * `2·tan(degrees / 2)`, the tangent-space reach of one full field of view,
+ * saturating at a right angle.
  *
  * A field of view of 90° or more spans the whole half-space in that axis, where
  * the tangent flips sign and would reject every pair; the overlap test wants
  * "no bound at all" instead.
  */
-private fun tanOf(degrees: Float): Double =
-    if (degrees >= 90f) Double.MAX_VALUE else tan(Math.toRadians(degrees.toDouble()))
+private fun overlapBound(degrees: Float): Double =
+    if (degrees >= 90f) Double.MAX_VALUE else 2.0 * tan(Math.toRadians(degrees / 2.0))

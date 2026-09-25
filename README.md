@@ -18,11 +18,11 @@ result screen offers it to the gallery and the share sheet.
 
 | Tool | Version |
 | --- | --- |
-| Android Gradle Plugin | 8.7.3 |
-| Gradle | 8.14.3 (via wrapper) |
-| Kotlin | 2.0.21 |
+| Android Gradle Plugin | 9.3.1 |
+| Gradle | 9.5.0 (via wrapper) |
+| Kotlin | 2.2.10 |
 | JDK | 17 |
-| compileSdk / targetSdk | 35 |
+| compileSdk / targetSdk | 37 |
 | minSdk | 26 |
 
 `minSdk` is 26 so the project can rely on adaptive launcher icons and modern
@@ -31,7 +31,7 @@ lowering it is possible — you would need to add pre-API-26 launcher icon PNGs.
 
 ## Build
 
-You need the Android SDK (compileSdk 35 + build-tools 35) and a JDK 17. The
+You need the Android SDK (compileSdk 37 + build-tools 37) and a JDK 17. The
 simplest route is Android Studio, which supplies both: open the project folder,
 let it sync, and it writes `local.properties` for you. From the command line:
 
@@ -152,8 +152,12 @@ Declared in
 | `HIGH_SAMPLING_RATE_SENSORS` | **normal** (install-time, API 31+) | >200 Hz gyro/accel sampling to track device attitude between frames |
 | `VIBRATE` | **normal** (install-time) | Haptic tick confirming an automatic capture |
 | `WRITE_EXTERNAL_STORAGE` | runtime, `maxSdkVersion="28"` | Saving on pre-scoped-storage devices |
-| `READ_EXTERNAL_STORAGE` | runtime, `maxSdkVersion="32"` | Reading spheres this app did not create |
-| `READ_MEDIA_IMAGES` | runtime (API 33+) | Same, on Android 13+ |
+
+No READ permission is declared: the app never reads the user's photo library —
+captured frames and finished spheres live in the app's own cache until the user
+exports them — so neither `READ_EXTERNAL_STORAGE` nor `READ_MEDIA_IMAGES` is
+declared, which also keeps the Android 14+ selected-photos grant state from
+ever arising.
 
 `HIGH_SAMPLING_RATE_SENSORS` is a normal permission — it is granted at install
 time, and requesting it at runtime always returns "denied". Declaring it is
@@ -180,6 +184,20 @@ gates the capture UI. It:
 - re-checks the grant on resume, so returning from Settings recovers without a
   restart.
 
+The grant is read back from the system rather than inferred from the launcher's
+result map, and that is load-bearing. When the dialog is dismissed **without an
+answer** — swiped away, interrupted by an incoming call, screen locked —
+`RequestMultiplePermissions` delivers an *empty* map, and
+`emptyMap().values.all { it }` is vacuously `true`: read straight from the map, a
+cancellation counts as a grant and drops the user onto the capture screen with no
+camera permission, where the bind fails and the viewfinder is simply black.
+
+That same cancellation must not be routed to the "permanently denied" branch
+either. `shouldShowRequestPermissionRationale` reads `false` after a cancel, so
+trusting it there would send someone who never answered the dialog off to the
+Settings app to fix a setting they had not touched. Only an explicit denial the
+system will no longer surface a dialog for earns that trip.
+
 ## Project layout
 
 ```
@@ -191,17 +209,19 @@ app/src/main/java/com/n30dyn4m1c/photosphere/
 │   ├── SphereCaptureCoordinator.kt # the capture rule and the run's position
 │   ├── TargetOverlay.kt         # reticle, target markers, dwell arc
 │   ├── SphereTarget.kt          # the sphere's target list
+│   ├── TargetSelection.kt       # which target is active (any-order capture)
 │   ├── SphereProjection.kt      # attitude + target -> screen position
 │   ├── AlignmentGate.kt         # 2° / 300 ms shutter rule
 │   ├── CameraOptics.kt          # field of view from the camera's optics
 │   └── CaptureFeedback.kt       # shutter sound + haptic tick
 ├── sensor/
-│   ├── OrientationTracker.kt    # rotation vector -> yaw/pitch/roll StateFlow
+│   ├── OrientationTracker.kt    # game rotation vector -> yaw/pitch/roll StateFlow
 │   ├── OrientationState.kt      # lifecycle-aware Compose bindings
 │   └── OrientationDebugScreen.kt# live readout for on-device verification
 ├── stitching/
 │   ├── PhotoSphereStitcher.kt   # the stitch: read, render, statuses, progress
 │   ├── SphericalGeometry.kt     # camera basis, canvas mapping, frame footprints
+│   ├── MultibandBlender.kt      # Laplacian-pyramid blend: levels, reconstruction
 │   └── EquirectangularRenderer.kt # projecting frames onto the sphere, blending
 ├── metadata/
 │   └── GPanoXmpInjector.kt      # GPano XMP into the JPEG header, no re-encode
@@ -211,22 +231,106 @@ app/src/main/java/com/n30dyn4m1c/photosphere/
 │   ├── SphereImageStore.kt      # cache sessions, the finished sphere, EXIF
 │   ├── MediaExporter.kt         # MediaStore write into Pictures/360Panoramas
 │   └── ImageBufferManager.kt    # this run's frames + their capture attitude
-└── ui/theme/                    # Material 3 theme
+└── ui/theme/
+    ├── Color.kt                 # the one palette: signals, glass, surfaces
+    ├── Theme.kt                 # the scheme — dark always, no dynamic colour
+    ├── Type.kt                  # the type scale
+    └── Shape.kt                 # the corner-radius ladder + PillShape
 ```
+
+## Interface
+
+Everything the user looks at sits on top of either a live viewfinder or a
+finished photograph, and that one fact settles most of the design decisions.
+The palette, type scale and shape ladder live in
+[`ui/theme/`](app/src/main/java/com/n30dyn4m1c/photosphere/ui/theme/) and are
+defined once each — the two signal colours in particular were previously hex
+literals repeated across three files, which is how a design drifts.
+
+### Dark always, and no dynamic colour
+
+`PhotoSphereTheme` takes no `darkTheme` or `dynamicColor` parameter. Both were
+removed deliberately:
+
+- **Dark in every configuration.** A light chrome around a viewfinder throws
+  light back at the user in exactly the situation where they are judging
+  exposure, and it tints the photograph it surrounds. The capture screen is
+  pinned to black regardless, so following the system into a light scheme only
+  ever produced a light result screen bolted onto a black capture screen.
+- **Material You off.** Dynamic colour repaints the interface from the user's
+  wallpaper. Guided capture is built on exactly two signals — accent for
+  "captured", active for "aim here next" — and they may not survive that
+  repaint as two colours that contrast with each other, let alone against an
+  arbitrary scene.
+
+Because the app is dark in every configuration, `MainActivity` also pins both
+system bars to **light icons** via `SystemBarStyle.dark(...)`. Left to the
+default they follow the system's day/night setting, and a phone in light mode
+paints dark status-bar icons over a black viewfinder.
+
+`res/values/colors.xml` holds `sphere_background`, the window background the
+platform paints before Compose takes over. It must stay in step with
+`SphereBackground` in `Color.kt` or every cold start flashes the wrong dark.
+
+### The two signals
+
+| Token | Meaning |
+| --- | --- |
+| `SphereAccent` (green) | aligned, locked, captured, complete — the "yes" |
+| `SphereActive` (amber) | the live target the reticle is being sent to |
+
+They are warm/cool opposites so the two never trade places at a glance, and
+both are bright enough to hold against a blown-out sky or a dark room. They are
+shared by the HUD and by `TargetOverlayColors`, so the marker on the overlay and
+the progress bar in the pill are the same green by construction.
+
+### Chrome over a moving image
+
+The HUD is one translucent material (`GlassSurface` / `GlassSurfaceDim`) rather
+than a handful of similar blacks, and gradient scrims run along **both** the top
+and the bottom of the frame — the guidance line and the finish button sit over
+live scene just as the progress pill does.
+
+Motion is used only where it carries meaning: the finish button arrives on an
+animation because the moment it appears is the moment the run stops being
+all-or-nothing; the progress bar slides so a landing frame registers in
+peripheral vision; the guidance line and the stitch stage crossfade so a change
+is noticeable without being read at that instant.
+
+### Accessibility
+
+The progress pill is collapsed to a single spoken sentence
+(`capture_progress_description`) — left to itself it handed a screen reader
+"12", "/ 48", "frames", a bare progress bar and "1 of 3 bands" as five unrelated
+announcements. Controls that are conditionally inert, such as the capture-scope
+selector once the first frame has locked the plan in, pass `enabled` to the
+component rather than checking it inside `onClick`, so a disabled control is not
+announced as actionable.
+
+Guided capture itself — aiming a reticle at a marker — remains unusable without
+sight; see the open issues.
 
 ## Device orientation
 
 [`OrientationTracker`](app/src/main/java/com/n30dyn4m1c/photosphere/sensor/OrientationTracker.kt)
-listens to `TYPE_ROTATION_VECTOR` — the *fused* sensor, so the attitude is
-absolute, north-referenced and drift-free — and publishes it as a
-`StateFlow<OrientationData>` of yaw, pitch and roll in degrees.
+listens to `TYPE_GAME_ROTATION_VECTOR` (gyroscope + accelerometer, falling back
+to `TYPE_ROTATION_VECTOR` on a device without one) and publishes it as a
+`StateFlow<OrientationData>` of yaw, pitch and roll in degrees. The game vector
+leaves the magnetometer out — the same choice Street View and Google Camera's
+Photo Sphere make. A sphere only needs the aim to be consistent *between
+frames*, and the compass is the one input that can make a still phone's heading
+jump by degrees indoors (a steel beam, a laptop, rebar in the floor); without it
+yaw is relative to an arbitrary zero and drifts by a fraction of a degree a
+minute instead, which a capture of a couple of minutes absorbs in its overlap.
+Nothing asks the user for a figure-eight calibration any more.
 
 The angles are read straight off the device→world rotation matrix, so they
 describe **where the rear camera points**, not the screen:
 
 1. **The camera basis.** `getRotationMatrixFromVector` gives the matrix mapping
-   device axes to the world frame (X east, Y north, Z up). The lens looks along
-   the device's -Z axis, so that is the camera's forward. Yaw is its compass
+   device axes to the world frame (Z up; with the game vector X and Y are a
+   fixed but arbitrary horizontal pair rather than east and north). The lens
+   looks along the device's -Z axis, so that is the camera's forward. Yaw is its
    bearing, elevation its height above the horizon (reported as a pitch that is
    **negative above the horizon**, matching the capture plan and the stitcher),
    and roll is the image's tilt about the forward axis.
@@ -296,10 +400,21 @@ frames stay a constant *angular* distance apart instead of bunching up as the
 rings shrink. The 35% overlap is what the feature-based pose refinement needs:
 it leaves every frame well inside its neighbours' view, and is the margin that
 absorbs a field-of-view estimate that runs high and a degree or two of sensor
-drift (see [Stitching](#stitching)). Rings are swept in alternating directions,
-and the whole plan is rotated to start at whatever bearing the user is already
-facing — capture opens with the reticle on the first marker rather than asking
-for magnetic north.
+drift (see [Stitching](#stitching)). The plan's default path is the horizon,
+then every ring up to the zenith, then every ring down to the nadir, each swept
+opposite to the one before, so the user never swings between ceiling and floor
+more than once. The whole plan is rotated to start at whatever bearing the user
+is already facing, and the stitched photo is centred on that bearing too — every
+360 viewer opens on the scene the run began with, and the wrap-around seam sits
+directly behind it.
+
+**Any order, Street View style.** The path is a default, not a rule
+([`TargetSelection`](app/src/main/java/com/n30dyn4m1c/photosphere/camera/TargetSelection.kt)).
+Aim squarely (within 6°) at any other uncaptured dot and it becomes the active
+target — fill a gap you can see, skip a frame someone is walking through and
+come back to it, or shoot in whatever order is comfortable. After each shot the
+active target hands over to the nearest uncaptured dot, with the plan's next one
+given a 12° head start so an ordinary sweep keeps its direction.
 
 The plan is laid out against 90% of the reported field of view, not all of it
 (`FIELD_OF_VIEW_SAFETY_FACTOR`). The overlap is only ever as good as the field
@@ -363,10 +478,20 @@ fires once the aim has been within **2°** of the active target continuously for
 **300 ms**. The dwell is what keeps a frame from being taken mid-swing: at a
 normal pan rate the reticle crosses a 2° window in far less than 300 ms, so only
 a deliberate stop trips it. Any sample outside the window clears the timer
-outright. The shutter also refuses to fire while the fused sensor reports its
-readings as unreliable, and the attitude stamped onto each frame is the mean
-over the dwell rather than a single sample — both take the jitter out of the
-pose the stitcher starts from. On success the shutter sound and a haptic tick
+outright. The shutter also refuses to fire while a compass-fused sensor reports
+its readings as unreliable (the game vector has no such state), and the
+attitude stamped onto each frame is the mean over the dwell rather than a single
+sample — both take the jitter out of the pose the stitcher starts from.
+
+**Bursts keep their own poses.** A burst of max-quality stills takes a couple of
+seconds on a Samsung, and the dwell mean only describes the moment before the
+first shot. Each shot therefore records the attitude at its own shutter
+(`onCaptureStarted`); the kept shot is stamped with the dwell mean only if it
+is within 0.4° of it, and with its own sample otherwise — so a hand that eases
+off after the first flash cannot put a later shot on the sphere where the first
+one was aimed. The sharpest shot is judged on the central half of the frame at
+the stitch's own ~2000 px input size, where a few pixels of handshake smear
+actually shows, rather than on a thumbnail where every candidate scores alike. On success the shutter sound and a haptic tick
 fire together, the marker turns green, and focus animates onto the next target.
 
 **Tap to focus, locked for the session.** Phone lenses have a fixed physical
@@ -476,6 +601,17 @@ reprojection, but the measured poses are not the last word:
   should be near, and a frame whose content gives no reliable matches keeps its
   measured pose, so a featureless sky or a blank wall degrades gracefully to the
   orientation-driven stitch rather than a failed one.
+- The same matches also sharpen the *field of view*. A focal-length error pulls
+  every bearing radially about the optical axis, so the residual the rotations
+  leave behind carries a measure of it: a per-frame focal correction is solved
+  by least squares from the matched bearings (Brown & Lowe's step) and the
+  stitcher projects through the corrected focal lengths. Frame 0 is anchored —
+  the whole sphere can be uniformly scaled without changing any alignment, so
+  the absolute scale is only defined relative to the frame held still — and
+  corrections are clamped to ±15% and gated behind at least forty agreeing
+  correspondences, so a featureless run keeps the device's reported field of
+  view. The radial distortion is re-normalised against each corrected focal
+  length, so the lens stays the same physical lens at its new focal.
 - Which pairs count as overlapping is a *directional* test rather than a single
   distance threshold: the second frame's aim is projected into the first's
   camera frame and must land within one field of view on both axes. A portrait
@@ -539,27 +675,66 @@ out to the full width, because every longitude passes underneath it.
 does the painting. Every output pixel is a direction; for each frame that
 direction is rotated into the frame's own axes and divided through by depth,
 which gives the pixel that looked at it (through the distortion model), and
-`Imgproc.remap` samples it. The exposure gains are applied before the mean, so
-they land inside the blend. Overlaps resolve to a weighted mean whose weight
-falls to zero at each frame's border, so a seam becomes a cross-fade rather than
-a line — and a pixel only one frame reached still comes out at full strength,
-because the weight divides back out.
+`Imgproc.remap` samples it. The exposure gains are applied before the blend, so
+they land inside it. Overlaps resolve to a multi-band (Laplacian pyramid)
+blend — see [`MultibandBlender`](app/src/main/java/com/n30dyn4m1c/photosphere/stitching/MultibandBlender.kt).
+Each frame and its feather mask are split into bands, and each band is
+cross-faded with a mask sized to the band: fine detail fades across a few
+pixels, broad illumination across the whole overlap, so a seam is faded at
+every scale by a transition narrower than the detail that scale carries. A
+pixel only one frame reached still comes out at full strength, because its
+mask divides back out.
+
+**Seam carving** is the alternative to the wide cross-fade, toggled by the
+debug **Seam** button next to Dist/Refine. [`SeamFinder`](app/src/main/java/com/n30dyn4m1c/photosphere/stitching/SeamFinder.kt)
+asks which single frame should paint each pixel, instead of letting every
+overlapping frame contribute, and the renderer then paints near-hard selections
+that fade only a few pixels across each cut — the sharpness a cross-fade
+spends. The question is posed as an energy over the overlap:
+
+- The **data term** for a pixel and a frame is how far the frame's sample sits
+  from the mean of every frame covering that pixel — the frame closest to what
+  the overlap actually shows wins the interior.
+- The **seam cost** for cutting between two neighbouring pixels with different
+  frames is how differently the two frames see those pixels, so a cut through a
+  region where the frames agree is cheap and a cut through a ghost is not. The
+  cost is a metric (a frame that does not cover a pixel is filled with that
+  pixel's mean colour, which keeps the triangle inequality intact), so every
+  expansion move is submodular and its exact min-cut can never raise the
+  energy.
+
+The energy is minimized with α-expansion — [`SeamSolver`](app/src/main/java/com/n30dyn4m1c/photosphere/stitching/SeamSolver.kt)
+— where each label in turn offers every pixel "keep your frame or switch to
+this one", and each binary subproblem is an s-t min-cut over the pixel grid
+(Dinic's max-flow). The whole solver is pure Kotlin, exercised on the JVM
+against an exhaustive search on tiny grids. The seam is decided at a reduced
+resolution (~512 columns across the canvas) because a cut only needs locating
+to within a few output pixels, and the graph-cut's cost scales with that grid
+rather than with the full canvas; [`SeamFeather`](app/src/main/java/com/n30dyn4m1c/photosphere/stitching/SeamWeights.kt)
+then turns the label map into the narrow cross-fade the renderer looks up — the
+winner holds weight 1 everywhere, and the loser's contribution ramps in from
+half on the boundary to nothing a few pixels away. The multi-band machinery is
+left to handle that narrow transition, so coarse illumination still meets
+softly where the seam runs, while fine detail keeps both copies — the point of
+carving instead of blending.
 
 The result is equirectangular *by construction* rather than by cropping
 something else into shape: a pixel's row is its latitude, so an incomplete sphere
 is black exactly where it was not shot, at the right elevation. The accuracy
 ceiling is how much of the residual pose error the content can resolve — the
-rotation vector sensor is fused and drift-free but not perfect, and the feature
+fused attitude sensor is steady but not perfect, and the feature
 refinement pulls the overlaps back into agreement instead of leaving soft
 doubling.
 
 **Memory.** A 4096-wide canvas needs 100 MB of float accumulator if it is held
 at once, which is exactly the allocation that ends a stitch on a mid-range
-phone. The canvas is built in horizontal bands instead, so only the band being
-accumulated exists in float and the peak is a few megabytes. The canvas is also
-never rendered wider than the frames justify — a 1024 px frame across 66° carries
-about 15.5 px per degree, so a full turn is worth ~5600 px, and rendering beyond
-that would only interpolate.
+phone. Every level of the blend is built in horizontal bands instead, so only
+the band being accumulated exists in float, and the coarse levels that carry
+the wide cross-fade live in mats a small fraction of the canvas — the peak is
+tens of megabytes rather than a hundred, the same order as the unsharp mask
+that runs after it. The canvas is also never rendered wider than the frames
+justify — a 1024 px frame across 66° carries about 15.5 px per degree, so a
+full turn is worth ~5600 px, and rendering beyond that would only interpolate.
 
 **The field of view is self-checked.** The angles handed to the stitcher describe
 the upright frame as captured on the portrait-locked display, and `stitchPhotos`
@@ -616,6 +791,13 @@ not have to be deleted out of the camera roll afterwards. "New photo" discards
 the cached JPEG and returns to capture with an empty buffer; the system back
 gesture does the same thing.
 
+Because that cached JPEG is the only copy until an export lands, both routes out
+**confirm first** while the sphere is unsaved — "New photo" sits directly beside
+"Share", and a stray tap on it (or a back gesture) would otherwise throw away
+several minutes of standing in one spot turning around, silently. Once the photo
+has been written to the gallery the question stops being worth asking and the
+prompt no longer appears.
+
 **Export.** [`MediaExporter`](app/src/main/java/com/n30dyn4m1c/photosphere/storage/MediaExporter.kt)
 copies the file into `Pictures/360Panoramas` through MediaStore. From API 29 the
 row is inserted with `IS_PENDING = 1`, the bytes are streamed into the URI
@@ -632,21 +814,38 @@ since API 24, so it travels as a `content://` URI from the app's `FileProvider`
 (`res/xml/file_paths.xml` exposes `cacheDir/spheres/` and nothing else) with a
 read grant attached.
 
-## Not implemented yet
+## Status
 
-- **Focal-length refinement.** The pose refinement assumes the camera's reported
-  focal length is right. It usually is — the optics come from the device's own
-  intrinsic calibration — but solving for a small per-frame focal correction
-  alongside the rotations (Brown & Lowe's step) would absorb the last bit of
-  scale error a loosely-described lens leaves behind.
-- **Multi-band blending.** The feathered weighted mean hides a residual pose
-  error well, but at high contrast (a dark doorway against a bright wall) a
-  Laplacian-pyramid blend would hide it better. That is a larger renderer
-  change, and the sharper the refined poses are, the less the seams need it.
-- **Seam carving.** Instead of blending every overlap, find the path through
-  each overlap where the frames agree most and cut there, fading only a few
-  pixels across it. The current cross-fade trades a little sharpness for the
-  certainty of never exposing a gap.
+The pipeline features that were once listed here as outstanding have all
+landed:
+
+- **Focal-length refinement** — the pose refinement solves a per-frame focal
+  correction from the matched bearings and the stitcher projects through it (see
+  [Stitching](#stitching)).
+- **Multi-band blending** — overlaps resolve to a Laplacian pyramid blend that
+  fades fine detail over a few pixels and broad illumination over the whole
+  overlap.
+- **Seam carving** — instead of blending every overlap, a graph-cut finds the
+  assignment of each pixel to the frame that agrees best and cuts there, fading
+  only a few pixels across it.
+
+What is still outstanding is tracked in
+[the issue tracker](https://github.com/n30dyn4m1c/360-photo-app/issues). The
+larger items at the time of writing: guided capture cannot be driven without
+sight, the result screen previews the sphere flat rather than as a pannable
+view, there are no instrumented UI tests, the strings are English-only, and the
+activity's hard portrait lock is ignored from Android 16 onward.
+
+## Test builds
+
+Debug APKs are published as
+[GitHub Release](https://github.com/n30dyn4m1c/360-photo-app/releases) assets
+rather than committed to the repository — a debug build of this app is ~43 MB,
+and committing one per rebuild grows the history by that much every time.
+
+To build your own, see [Build](#build); `./gradlew assembleDebug` writes one APK
+per ABI to `app/build/outputs/apk/debug/`. Take `app-arm64-v8a-debug.apk` for
+any modern phone.
 
 ## License
 

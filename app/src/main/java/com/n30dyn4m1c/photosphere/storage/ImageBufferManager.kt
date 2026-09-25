@@ -1,12 +1,17 @@
 package com.n30dyn4m1c.photosphere.storage
 
 import android.content.Context
+import android.content.ContextWrapper
 import android.graphics.Bitmap
 import android.util.Log
+import androidx.activity.ComponentActivity
 import androidx.camera.core.ImageCapture
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.platform.LocalContext
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.ViewModelStore
 import com.n30dyn4m1c.photosphere.sensor.OrientationData
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
@@ -20,11 +25,27 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 
 private const val TAG = "ImageBufferManager"
 
 /** Quality used when a caller hands over a [Bitmap] instead of a file. */
 private const val DEFAULT_JPEG_QUALITY = 95
+
+/** Key the manager is stored under in the activity's [ViewModelStore]. */
+private const val BUFFER_HOLDER_KEY = "photosphere.ImageBufferManager"
+
+/**
+ * Thrown (as a failed [Result]) when a frame's session was cancelled while its
+ * shutter was in flight.
+ *
+ * The caller reports a superseded session as a *silent* drop rather than as a
+ * capture failure: the user asked for the restart, so the frame disappearing is
+ * the expected outcome, not something to surface as an error.
+ */
+class SessionSupersededException :
+    IllegalStateException("session superseded, frame not captured")
 
 /**
  * One buffered frame: where the pixels live, and where the camera was pointing.
@@ -46,6 +67,15 @@ data class BufferedFrame(
     val pitchDegrees: Float,
     /** Side tilt at capture, -180°..180°. */
     val rollDegrees: Float,
+    /**
+     * The camera's basis as a rotation matrix — the `[right, −up, forward]`
+     * columns in the world frame, in the `CameraBasis.toRotationMatrix` layout.
+     * Present for every frame the tracker captured, and what the stitcher
+     * reconstructs the pose from: it carries the orientation exactly where the
+     * Euler components collapse (a frame aimed at the zenith). Null for frames
+     * recorded without a sensor sample, e.g. in tests.
+     */
+    val cameraBasis: FloatArray? = null,
     /** Wall clock at capture, for ordering frames of equal index. */
     val capturedAtMillis: Long,
 ) {
@@ -161,13 +191,15 @@ class ImageBufferManager(
 
         var winner = best
         if (canonical != null && best != canonical) {
-            if (canonical.exists() && !canonical.delete()) {
-                Log.w(TAG, "Could not replace ${canonical.name}")
-            }
-            if (best.renameTo(canonical)) {
+            // An atomic replace: the promotion either lands whole or leaves the
+            // previous attempt in place. Deleting the canonical first would open
+            // a window where both copies of the index are gone if the process
+            // died between the two calls.
+            try {
+                Files.move(best.toPath(), canonical.toPath(), StandardCopyOption.REPLACE_EXISTING)
                 winner = canonical
-            } else {
-                Log.w(TAG, "Could not promote ${best.name} to ${canonical.name}")
+            } catch (e: IOException) {
+                Log.w(TAG, "Could not promote ${best.name} to ${canonical.name}", e)
             }
         }
 
@@ -202,36 +234,41 @@ class ImageBufferManager(
         index: Int,
         orientation: OrientationData,
     ): BufferedFrame? {
-        if (file.parentFile?.name != _sessionId.value) {
-            Log.w(TAG, "Dropping ${file.name} from superseded session")
-            withContext(NonCancellable + ioDispatcher) { file.delete() }
-            return null
-        }
+        // The session check and the append share one lock so a concurrent
+        // cancelSession cannot land between them: without that, a frame from the
+        // cancelled session could be appended to the new session's list — a
+        // buffered entry whose file has just been deleted.
+        mutex.withLock {
+            if (file.parentFile?.name != _sessionId.value) {
+                Log.w(TAG, "Dropping ${file.name} from superseded session")
+                withContext(NonCancellable + ioDispatcher) { file.delete() }
+                return null
+            }
 
-        withContext(ioDispatcher) {
-            SphereImageStore.stampCaptureOrientation(
-                file = file,
+            withContext(ioDispatcher) {
+                SphereImageStore.stampCaptureOrientation(
+                    file = file,
+                    index = index,
+                    yawDegrees = orientation.yawDegrees,
+                    pitchDegrees = orientation.pitchDegrees,
+                    rollDegrees = orientation.rollDegrees,
+                )
+            }
+
+            val frame = BufferedFrame(
                 index = index,
+                file = file,
                 yawDegrees = orientation.yawDegrees,
                 pitchDegrees = orientation.pitchDegrees,
                 rollDegrees = orientation.rollDegrees,
+                cameraBasis = orientation.cameraBasis,
+                capturedAtMillis = System.currentTimeMillis(),
             )
-        }
 
-        val frame = BufferedFrame(
-            index = index,
-            file = file,
-            yawDegrees = orientation.yawDegrees,
-            pitchDegrees = orientation.pitchDegrees,
-            rollDegrees = orientation.rollDegrees,
-            capturedAtMillis = System.currentTimeMillis(),
-        )
-
-        mutex.withLock {
             _frames.value = (_frames.value.filterNot { it.index == index } + frame)
                 .sortedBy(BufferedFrame::index)
+            return frame
         }
-        return frame
     }
 
     /**
@@ -272,7 +309,9 @@ class ImageBufferManager(
      */
     suspend fun undoLastFrame(): BufferedFrame? {
         val dropped = mutex.withLock {
-            val last = _frames.value.maxByOrNull(BufferedFrame::index) ?: return null
+            // The most recently *shot* frame, not the highest index: targets
+            // can be captured in any order, and undo takes back the last shot.
+            val last = _frames.value.maxByOrNull(BufferedFrame::capturedAtMillis) ?: return null
             _frames.value = _frames.value.filterNot { it == last }
             last
         }
@@ -329,8 +368,9 @@ class ImageBufferManager(
             SphereImageStore.deleteSession(appContext, previous)
         }
 
-        // The id has one-second resolution, so a restart inside the same second
-        // reuses the name. That is harmless now the directory itself is gone.
+        // The id has millisecond precision (see SphereImageStore.newSessionId),
+        // so a restart inside the same millisecond would reuse the name. That
+        // is harmless now the directory itself is gone.
         val next = SphereImageStore.newSessionId()
         _sessionId.value = next
         return next
@@ -344,15 +384,48 @@ class ImageBufferManager(
     }
 }
 
+/** A [ViewModel] whose only job is to hold the buffer across configuration changes. */
+private class BufferHolder : ViewModel() {
+    var manager: ImageBufferManager? = null
+}
+
 /**
- * An [ImageBufferManager] scoped to the current composition.
+ * An [ImageBufferManager] that survives configuration changes.
  *
- * Survives recomposition but not configuration changes; the frames themselves
- * are on disk either way, and a session that outlives its screen is cleared by
+ * The manager is kept in the activity's [ViewModelStore], so a recreation —
+ * font scale, locale, dark mode, a foldable resize, or an Android 16 large
+ * screen being force-rotated — keeps the session and its frames instead of
+ * starting a fresh (empty) session whose first act would be to prune the
+ * previous run's files out from under the user. The store lives exactly as
+ * long as the activity, which is the manager's natural lifetime: a session
+ * abandoned because the activity was finished is cleared by
  * [ImageBufferManager.pruneStaleSessions] on the next run.
+ *
+ * Falls back to composition scope when there is no activity (a preview).
  */
 @Composable
 fun rememberImageBufferManager(): ImageBufferManager {
     val context = LocalContext.current
-    return remember(context) { ImageBufferManager(context) }
+    val store = remember { context.findActivity()?.viewModelStore }
+    if (store == null) {
+        return remember(context) { ImageBufferManager(context) }
+    }
+    return remember(store) {
+        // Through the public provider rather than ViewModelStore.put, which is
+        // a library-internal API.
+        val holder = ViewModelProvider(
+            store,
+            object : ViewModelProvider.Factory {
+                @Suppress("UNCHECKED_CAST")
+                override fun <T : ViewModel> create(modelClass: Class<T>): T = BufferHolder() as T
+            },
+        )[BUFFER_HOLDER_KEY, BufferHolder::class.java]
+        holder.manager ?: ImageBufferManager(context).also { holder.manager = it }
+    }
+}
+
+private tailrec fun Context.findActivity(): ComponentActivity? = when (this) {
+    is ComponentActivity -> this
+    is ContextWrapper -> baseContext.findActivity()
+    else -> null
 }

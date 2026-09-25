@@ -37,6 +37,29 @@ class SphereCaptureCoordinatorTest {
         gate = AlignmentGate(thresholdDegrees = 2f, dwellMillis = 300L),
     )
 
+    /**
+     * Stands in for the image buffer: the plan indices that hold a frame. The
+     * coordinator reads it, never writes it — as with the real buffer, a frame
+     * landing or being undone is the caller's doing.
+     */
+    private val buffered = mutableSetOf<Int>()
+
+    /** The frame for [capture] lands in the buffer, and is reported. */
+    private suspend fun SphereCaptureCoordinator.land(capture: CaptureDecision.Capture): Boolean {
+        buffered += capture.index
+        return onCaptured(
+            token = capture.token,
+            captured = buffered.toSet(),
+            orientation = sample(plan[capture.index].yawDegrees),
+        )
+    }
+
+    /** What the undo callback does to the buffer: drops [index]'s frame. */
+    private fun dropFrame(index: Int): Int {
+        buffered -= index
+        return index
+    }
+
     private fun sample(
         yawDegrees: Float,
         pitchDegrees: Float = 0f,
@@ -54,10 +77,13 @@ class SphereCaptureCoordinatorTest {
         nowMillis: Long,
         accuracy: OrientationAccuracy = OrientationAccuracy.High,
         isStitching: Boolean = false,
+        canTrigger: Boolean = true,
     ): CaptureDecision = onSample(
         orientation = sample(yawDegrees, accuracy = accuracy),
         nowMillis = nowMillis,
         isStitching = isStitching,
+        captured = { buffered.toSet() },
+        canTrigger = canTrigger,
         createPlan = { plan },
     )
 
@@ -115,7 +141,7 @@ class SphereCaptureCoordinatorTest {
         assertEquals(0, coordinator.guidance.value.activeIndex)
         assertTrue(coordinator.guidance.value.isCapturing)
 
-        assertTrue(coordinator.onCaptured(capture.token))
+        assertTrue(coordinator.land(capture))
         assertEquals(1, coordinator.guidance.value.activeIndex)
         assertFalse(coordinator.guidance.value.isCapturing)
     }
@@ -147,7 +173,7 @@ class SphereCaptureCoordinatorTest {
         assertEquals(0, coordinator.guidance.value.activeIndex)
 
         // And the capture it refused for still completes normally.
-        assertTrue(coordinator.onCaptured(capture.token))
+        assertTrue(coordinator.land(capture))
         assertEquals(1, coordinator.guidance.value.activeIndex)
     }
 
@@ -156,12 +182,12 @@ class SphereCaptureCoordinatorTest {
         val coordinator = coordinator()
 
         val first = coordinator.holdUntilCapture(yawDegrees = 0f, startMillis = 0L)
-        coordinator.onCaptured(first.token)
+        coordinator.land(first)
         val second = coordinator.holdUntilCapture(yawDegrees = 90f, startMillis = 1_000L)
-        coordinator.onCaptured(second.token)
+        coordinator.land(second)
         assertEquals(2, coordinator.guidance.value.activeIndex)
 
-        assertTrue(coordinator.undo { 1 })
+        assertTrue(coordinator.undo { dropFrame(1) })
         assertEquals(1, coordinator.guidance.value.activeIndex)
     }
 
@@ -170,7 +196,7 @@ class SphereCaptureCoordinatorTest {
         val coordinator = coordinator()
 
         val capture = coordinator.holdUntilCapture(yawDegrees = 0f, startMillis = 0L)
-        coordinator.onCaptured(capture.token)
+        coordinator.land(capture)
 
         assertFalse(coordinator.undo { null })
         assertEquals(1, coordinator.guidance.value.activeIndex)
@@ -187,9 +213,9 @@ class SphereCaptureCoordinatorTest {
 
         // Two frames already down; the run is on target 2.
         val first = coordinator.holdUntilCapture(yawDegrees = 0f, startMillis = 0L)
-        coordinator.onCaptured(first.token)
+        coordinator.land(first)
         val second = coordinator.holdUntilCapture(yawDegrees = 90f, startMillis = 1_000L)
-        coordinator.onCaptured(second.token)
+        coordinator.land(second)
         assertEquals(2, coordinator.guidance.value.activeIndex)
 
         // Target 2's shutter is authorised but its frame is still being written.
@@ -197,14 +223,15 @@ class SphereCaptureCoordinatorTest {
         assertEquals(2, third.index)
 
         // The user taps undo mid-write. It is refused, so frame 1 survives.
-        assertFalse(coordinator.undo { 1 })
+        assertFalse(coordinator.undo { dropFrame(1) })
 
         // The write finishes and reports back.
-        assertTrue(coordinator.onCaptured(third.token))
+        assertTrue(coordinator.land(third))
 
-        // Three frames shot, reticle on target 3 — not on 2 with a hole behind
-        // it, which is what the unserialised version left behind.
-        assertEquals(3, coordinator.guidance.value.activeIndex)
+        // Three frames shot and the run complete — not back on 2 with a hole
+        // behind it, which is what the unserialised version left behind.
+        assertEquals(3, coordinator.guidance.value.capturedTargets)
+        assertTrue(coordinator.guidance.value.isComplete)
     }
 
     @Test
@@ -219,7 +246,7 @@ class SphereCaptureCoordinatorTest {
         assertEquals(0, coordinator.guidance.value.activeIndex)
         assertNull(coordinator.guidance.value.plan)
 
-        assertFalse(coordinator.onCaptured(capture.token))
+        assertFalse(coordinator.land(capture))
         assertEquals(0, coordinator.guidance.value.activeIndex)
     }
 
@@ -228,18 +255,18 @@ class SphereCaptureCoordinatorTest {
         val coordinator = coordinator()
 
         val first = coordinator.holdUntilCapture(yawDegrees = 0f, startMillis = 0L)
-        coordinator.onCaptured(first.token)
+        coordinator.land(first)
         val second = coordinator.holdUntilCapture(yawDegrees = 90f, startMillis = 1_000L)
 
         // The undo is refused while the shutter is in flight, so force the
         // out-of-order case the token exists for: report the capture, undo, then
         // replay the stale completion.
-        coordinator.onCaptured(second.token)
-        assertTrue(coordinator.undo { 1 })
+        coordinator.land(second)
+        assertTrue(coordinator.undo { dropFrame(1) })
         assertEquals(1, coordinator.guidance.value.activeIndex)
 
         // A duplicate completion for a run that has since moved.
-        assertFalse(coordinator.onCaptured(second.token))
+        assertFalse(coordinator.land(second))
         assertEquals(1, coordinator.guidance.value.activeIndex)
     }
 
@@ -295,7 +322,7 @@ class SphereCaptureCoordinatorTest {
                 yawDegrees = plan[it].yawDegrees,
                 startMillis = now,
             )
-            coordinator.onCaptured(capture.token)
+            coordinator.land(capture)
             now += 1_000L
         }
 
@@ -329,12 +356,12 @@ class SphereCaptureCoordinatorTest {
         val coordinator = coordinator()
 
         val capture = coordinator.holdUntilCapture(yawDegrees = 0f, startMillis = 0L)
-        coordinator.onCaptured(capture.token)
+        coordinator.land(capture)
 
         // An undo whose buffer work suspends. Nothing else may observe or change
         // the run's position while it is in there.
         val bufferWork = CompletableDeferred<Int>()
-        val undo = launch { coordinator.undo { bufferWork.await() } }
+        val undo = launch { coordinator.undo { dropFrame(bufferWork.await()) } }
 
         // The sample loop blocks on the lock rather than reading a half-applied
         // undo, so this cannot complete until the undo does.
@@ -346,5 +373,50 @@ class SphereCaptureCoordinatorTest {
         sampled.join()
 
         assertEquals(0, coordinator.guidance.value.activeIndex)
+    }
+
+    @Test
+    fun `aiming squarely at another uncaptured target shoots that one`() = runTest {
+        val coordinator = coordinator()
+        coordinator.feed(0f, 0L)
+        assertEquals(0, coordinator.guidance.value.activeIndex)
+
+        // Straight to the far target, skipping the plan's next one.
+        val capture = coordinator.holdUntilCapture(yawDegrees = 180f, startMillis = 1_000L)
+        assertEquals(2, capture.index)
+        assertTrue(coordinator.land(capture))
+
+        // The skipped targets are still there to shoot, in any order.
+        assertEquals(1, coordinator.guidance.value.capturedTargets)
+        assertFalse(coordinator.guidance.value.isComplete)
+    }
+
+    @Test
+    fun `an undone target stays active until it is reshot`() = runTest {
+        val coordinator = coordinator()
+        coordinator.land(coordinator.holdUntilCapture(yawDegrees = 0f, startMillis = 0L))
+        coordinator.land(coordinator.holdUntilCapture(yawDegrees = 90f, startMillis = 1_000L))
+
+        assertTrue(coordinator.undo { dropFrame(1) })
+
+        // The user is still pointing wherever they were; the undone target
+        // stays the one to shoot rather than being handed over again.
+        coordinator.feed(170f, 2_000L)
+        assertEquals(1, coordinator.guidance.value.activeIndex)
+        assertEquals(setOf(0), coordinator.guidance.value.captured)
+    }
+
+    @Test
+    fun `the shutter waits for the exposure lock but the reticle still holds`() = runTest {
+        val coordinator = coordinator()
+
+        coordinator.feed(0f, 0L, canTrigger = false)
+        val held = coordinator.feed(0f, 300L, canTrigger = false)
+        assertTrue(held is CaptureDecision.Guide)
+        assertTrue((held as CaptureDecision.Guide).isHolding)
+
+        // Once the lock lands, the next full dwell fires.
+        coordinator.feed(0f, 301L)
+        assertTrue(coordinator.feed(0f, 601L) is CaptureDecision.Capture)
     }
 }

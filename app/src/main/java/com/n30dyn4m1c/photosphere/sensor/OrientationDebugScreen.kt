@@ -323,7 +323,7 @@ private fun cardinalFor(yawDegrees: Float): String = when {
 @Preview(showBackground = true, heightDp = 900)
 @Composable
 private fun OrientationDebugPreview() {
-    PhotoSphereTheme(dynamicColor = false) {
+    PhotoSphereTheme {
         OrientationDebugContent(
             orientation = OrientationData(
                 yawDegrees = 62.4f,
@@ -341,7 +341,7 @@ private fun OrientationDebugPreview() {
 @Preview(showBackground = true, name = "No rotation vector")
 @Composable
 private fun OrientationDebugUnavailablePreview() {
-    PhotoSphereTheme(dynamicColor = false) {
+    PhotoSphereTheme {
         OrientationDebugContent(
             orientation = OrientationData(),
             isSensorAvailable = false,

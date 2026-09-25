@@ -24,6 +24,7 @@ import java.io.File
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
+import kotlin.math.sqrt
 import kotlin.math.tan
 
 private const val TAG = "PhotoSphereStitcher"
@@ -103,6 +104,9 @@ enum class StitchStage {
     /** Matching features between overlapping frames and correcting the poses. */
     Refining,
 
+    /** Finding the seam lines the overlaps will be cut along. */
+    Seaming,
+
     /** Projecting frames onto the sphere and blending the overlaps. */
     Stitching,
 
@@ -113,10 +117,11 @@ enum class StitchStage {
 /**
  * How far along a stitch is.
  *
-     * [StitchStage.Reading], [StitchStage.Refining] and [StitchStage.Stitching]
-     * all report real progress — one frame, one edge and one band of canvas at
-     * a time. The short stages either side leave [fraction] null, and the UI
-     * shows an indeterminate spinner for those rather than a bar that lies.
+     * [StitchStage.Reading], [StitchStage.Refining], [StitchStage.Seaming] and
+     * [StitchStage.Stitching] all report real progress — one frame, one edge,
+     * one seam and one band of canvas at a time. The short stages either side
+     * leave [fraction] null, and the UI shows an indeterminate spinner for
+     * those rather than a bar that lies.
      */
 data class StitchProgress(
     val stage: StitchStage,
@@ -158,14 +163,20 @@ data class SphereFrame(
  * is left is a reprojection: every pixel of the output canvas is a direction on
  * the sphere, and for each frame that direction is rotated into the frame's axes
  * and divided through by depth to find the pixel that saw it. Overlaps are
- * resolved by a feathered weighted mean, so seams cross-fade.
+ * resolved by multi-band blending (see [MultibandBlender]): every frame and its
+ * feather mask are split into Laplacian/Gaussian pyramids and each band is
+ * cross-faded with a mask sized to the band, so a seam is faded at every scale
+ * by a transition narrower than the detail that scale carries.
  *
  * The measured poses are not the last word. [PoseRefiner] matches ORB features
  * between overlapping frames and solves for a small per-frame correction on top
  * of the sensor pose — the sensor stays the starting guess and the fallback, and
- * the image content decides the fine alignment. The lens's radial distortion is
- * carried through the whole model (see [RadialDistortion]) so frame edges,
- * where seams live, land where the lens really put them, and
+ * the image content decides the fine alignment. The same matches also refine
+ * the field of view: a per-frame focal scale is solved from the matched
+ * bearings, so the last bit of scale error a loosely-described lens leaves
+ * behind is absorbed before rendering (see [PoseRefiner]). The lens's radial
+ * distortion is carried through the whole model (see [RadialDistortion]) so
+ * frame edges, where seams live, land where the lens really put them, and
  * [ExposureCompensation] equalises per-frame brightness so the blends do not
  * show seams of light.
  *
@@ -294,6 +305,12 @@ object PhotoSphereStitcher {
      * model the refinement assumes. Pass true to let image content correct the
      * measured poses where the features agree.
      *
+     * [useSeams] opts into seam carving: instead of the wide cross-fade, every
+     * pixel is painted by the single frame the graph-cut [SeamFinder] assigns
+     * it, and only a few pixels across each cut blend the loser in — sharper
+     * overlaps at the price of a little compute and a seam that is only as
+     * good as the frames agree.
+     *
      * [onProgress] is called from the stitching thread, not the main one — hand
      * the value to a `StateFlow` or post it rather than writing Compose state
      * from it directly.
@@ -311,13 +328,28 @@ object PhotoSphereStitcher {
         pivot: PivotModel = PivotModel.None,
         portraitRotationDegrees: Int = 90,
         useRefinement: Boolean = false,
+        useSeams: Boolean = false,
         debugColorFrames: Boolean = false,
         longitudeSpanDegrees: Float = 360f,
         centerLongitudeDegrees: Float = 0f,
         latitudeSpanDegrees: Float = 180f,
         centerLatitudeDegrees: Float = 0f,
         onProgress: (StitchProgress) -> Unit = {},
-    ): Result<Bitmap> = withContext(Dispatchers.Default) {
+    ): Result<Bitmap> {
+        // The span arguments size the canvas; degenerate values would otherwise
+        // drive the allocation to Int.MAX_VALUE rows (or a zero-width canvas)
+        // and surface as a confusing OutOfMemory instead of a clear error.
+        require(longitudeSpanDegrees in 1f..360f) {
+            "longitudeSpanDegrees must be in 1..360, was $longitudeSpanDegrees"
+        }
+        require(latitudeSpanDegrees in 1f..180f) {
+            "latitudeSpanDegrees must be in 1..180, was $latitudeSpanDegrees"
+        }
+        require(centerLatitudeDegrees in -90f..90f) {
+            "centerLatitudeDegrees must be in -90..90, was $centerLatitudeDegrees"
+        }
+
+        return withContext(Dispatchers.Default) {
         val decoded = ArrayList<DecodedFrame>(frames.size)
         try {
             onProgress(StitchProgress.Preparing)
@@ -367,78 +399,105 @@ object PhotoSphereStitcher {
                 ensureActive()
                 onProgress(StitchProgress(StitchStage.Reading, position, frames.size))
 
-                var image = readFrame(frame.file, maxInputDimension)
+                val read = readFrame(frame.file, maxInputDimension)
+                var image = read.image
 
-                // A frame must land on the sphere the same way its pose describes
-                // it. The pose is display-upright, so a frame that decoded in the
-                // sensor's native (landscape) orientation — its EXIF rotation tag
-                // missing, or lost when the metadata rewrite re-encoded the JPEG
-                // — has to be turned upright *here*, or its content paints onto
-                // the sphere rotated 90° against the measured pose and no two
-                // frames line up. `portraitRotationDegrees` is exactly the turn
-                // CameraX would have recorded in the tag.
-                if (image.cols() > image.rows() && portraitRotationDegrees % 180 == 90) {
-                    Log.w(
+                // From here the frame is owned by this iteration: a failure
+                // before it is handed to `decoded` — the FOV correction, the
+                // intrinsics, the placement — must not leak its native buffer.
+                // Mat.release is idempotent, so releasing one that
+                // `rotateClockwise` already released on its way out is safe.
+                try {
+                    // A frame must land on the sphere the same way its pose
+                    // describes it. The pose is display-upright, so a frame that
+                    // decoded in the sensor's native (landscape) orientation —
+                    // its EXIF rotation tag missing, or lost when the metadata
+                    // rewrite re-encoded the JPEG — has to be turned upright
+                    // *here*, or its content paints onto the sphere rotated 90°
+                    // against the measured pose and no two frames line up.
+                    // `portraitRotationDegrees` is exactly the turn CameraX
+                    // would have recorded in the tag.
+                    //
+                    // The fallback is gated on the tag being genuinely absent.
+                    // A frame whose tag is *present* (including NORMAL) is the
+                    // camera's own statement about its orientation, and a
+                    // landscape frame with NORMAL is a genuine landscape
+                    // capture — rotating it would paint its content sideways
+                    // against its pose, which is exactly the failure the
+                    // fallback exists to prevent for portrait frames. Those
+                    // frames go on to [correctFovOrientation] landscape, which
+                    // adapts the field of view to their real shape.
+                    if (image.cols() > image.rows() &&
+                        !read.hasExifOrientation &&
+                        portraitRotationDegrees % 180 == 90
+                    ) {
+                        Log.w(
+                            TAG,
+                            "Frame $position decoded ${image.cols()}x${image.rows()} with no " +
+                                "EXIF orientation — rotating ${portraitRotationDegrees}° " +
+                                "clockwise against the ${horizontalFov}°x${verticalFov}° FOV",
+                        )
+                        image = rotateClockwise(image, portraitRotationDegrees)
+                    }
+                    Log.i(
                         TAG,
-                        "Frame $position decoded ${image.cols()}x${image.rows()} — " +
-                            "transposed against the ${horizontalFov}°x${verticalFov}° FOV; " +
-                            "rotating ${portraitRotationDegrees}° clockwise",
+                        "Frame $position decoded ${image.cols()}x${image.rows()} at pose " +
+                            "yaw=${frame.pose.yawDegrees}° pitch=${frame.pose.pitchDegrees}° " +
+                            "roll=${frame.pose.rollDegrees}°",
                     )
-                    image = rotateClockwise(image, portraitRotationDegrees)
-                }
-                Log.i(
-                    TAG,
-                    "Frame $position decoded ${image.cols()}x${image.rows()} at pose " +
-                        "yaw=${frame.pose.yawDegrees}° pitch=${frame.pose.pitchDegrees}° " +
-                        "roll=${frame.pose.rollDegrees}°",
-                )
-                if (debugColorFrames) {
-                    // Paint the frame a solid colour so the finished pano shows
-                    // exactly where each frame was placed — the placement check.
-                    image.setTo(DEBUG_FRAME_COLORS[position % DEBUG_FRAME_COLORS.size])
-                }
-                if (!fovChecked) {
-                    val corrected = correctFovOrientation(
+                    if (debugColorFrames) {
+                        // Paint the frame a solid colour so the finished pano
+                        // shows exactly where each frame was placed — the
+                        // placement check.
+                        image.setTo(DEBUG_FRAME_COLORS[position % DEBUG_FRAME_COLORS.size])
+                    }
+                    if (!fovChecked) {
+                        val corrected = correctFovOrientation(
+                            widthPx = image.cols(),
+                            heightPx = image.rows(),
+                            horizontalFovDegrees = horizontalFov,
+                            verticalFovDegrees = verticalFov,
+                        )
+                        if (corrected != null) {
+                            Log.w(
+                                TAG,
+                                "FOV ${horizontalFov}°x${verticalFov}° does not match the " +
+                                    "${image.cols()}x${image.rows()} frame; using " +
+                                    "${corrected.first}°x${corrected.second}°",
+                            )
+                            horizontalFov = corrected.first
+                            verticalFov = corrected.second
+                        }
+                        fovChecked = true
+                    }
+                    // The lens's unitless coefficients are converted against the
+                    // focal length *this* decoded frame implies, so a frame
+                    // subsampled to any size still carries the same physical
+                    // lens.
+                    val intrinsics = FrameIntrinsics.forLens(
                         widthPx = image.cols(),
                         heightPx = image.rows(),
                         horizontalFovDegrees = horizontalFov,
                         verticalFovDegrees = verticalFov,
+                        distortion = radialDistortion,
                     )
-                    if (corrected != null) {
-                        Log.w(
-                            TAG,
-                            "FOV ${horizontalFov}°x${verticalFov}° does not match the " +
-                                "${image.cols()}x${image.rows()} frame; using " +
-                                "${corrected.first}°x${corrected.second}°",
+                    if (position == 0) {
+                        canvasWidth = canvasWidthFor(
+                            frameWidthPx = image.cols(),
+                            horizontalFovDegrees = horizontalFov,
+                            maxOutputWidth = maxOutputWidth,
+                            longitudeSpanDegrees = longitudeSpanDegrees,
                         )
-                        horizontalFov = corrected.first
-                        verticalFov = corrected.second
                     }
-                    fovChecked = true
-                }
-                // The lens's unitless coefficients are converted against the
-                // focal length *this* decoded frame implies, so a frame
-                // subsampled to any size still carries the same physical lens.
-                val intrinsics = FrameIntrinsics.forLens(
-                    widthPx = image.cols(),
-                    heightPx = image.rows(),
-                    horizontalFovDegrees = horizontalFov,
-                    verticalFovDegrees = verticalFov,
-                    distortion = radialDistortion,
-                )
-                if (position == 0) {
-                    canvasWidth = canvasWidthFor(
-                        frameWidthPx = image.cols(),
-                        horizontalFovDegrees = horizontalFov,
-                        maxOutputWidth = maxOutputWidth,
-                        longitudeSpanDegrees = longitudeSpanDegrees,
+                    decoded += DecodedFrame(
+                        image = image,
+                        intrinsics = intrinsics,
+                        sensorBasis = CameraBasis.of(frame.pose),
                     )
+                } catch (e: Throwable) {
+                    image.release()
+                    throw e
                 }
-                decoded += DecodedFrame(
-                    image = image,
-                    intrinsics = intrinsics,
-                    sensorBasis = CameraBasis.of(frame.pose),
-                )
             }
             onProgress(StitchProgress(StitchStage.Reading, frames.size, frames.size))
             val canvasHeight = canvasHeightFor(canvasWidth, longitudeSpanDegrees, latitudeSpanDegrees)
@@ -474,6 +533,7 @@ object PhotoSphereStitcher {
                     bases = sensor.map { CameraBasis.fromRotationMatrix(it) },
                     gains = FloatArray(decoded.size) { 1f },
                     matchedEdges = 0,
+                    focalScales = DoubleArray(decoded.size) { 1.0 },
                 )
             }
 
@@ -483,10 +543,12 @@ object PhotoSphereStitcher {
                     "y=${p.yawDegrees.roundToInt()}/p=${p.pitchDegrees.roundToInt()}/" +
                         "r=${p.rollDegrees.roundToInt()}"
                 }
+                val focals = refinement.focalScales.map { "%.4f".format(it) }
                 Log.i(
                     TAG,
                     "Refinement matched ${refinement.matchedEdges} edges; " +
-                        "refined poses: ${poses.joinToString(", ")}",
+                        "refined poses: ${poses.joinToString(", ")}; " +
+                        "focal scales: ${focals.joinToString(", ")}",
                 )
             }
 
@@ -494,7 +556,12 @@ object PhotoSphereStitcher {
             decoded.indices.forEach { index ->
                 ensureActive()
                 val basis = refinement.bases[index]
-                val intrinsics = decoded[index].intrinsics
+                // The focal refinement may have decided the reported field of
+                // view was off; the scale is applied to the frame's intrinsics
+                // (and the radial model re-normalised against the new focal
+                // length) so the footprint and the renderer both see the lens
+                // the feature matches measured.
+                val intrinsics = decoded[index].intrinsics.scaledBy(refinement.focalScales[index])
                 prepared += PreparedFrame(
                     image = decoded[index].image,
                     basis = basis,
@@ -514,15 +581,50 @@ object PhotoSphereStitcher {
             }
 
             ensureActive()
-            onProgress(StitchProgress(StitchStage.Stitching))
-            // Captured rather than called inside the lambda: the renderer is not
-            // a suspending function, so the context has to be carried in.
+            // Captured rather than called inside the lambdas below: the seam
+            // finder and the renderer are not suspending functions, so the
+            // context has to be carried in.
             val context = currentCoroutineContext()
+
+            // Seam carving: decide which frame paints each pixel, then render
+            // with the wide cross-fade replaced by a near-hard cut that fades
+            // only a few pixels across it. Without it the render falls back to
+            // the multi-band blend.
+            val seams = if (useSeams) {
+                onProgress(StitchProgress(StitchStage.Seaming))
+                SeamFinder.computeSeams(
+                    frames = prepared,
+                    canvasWidth = canvasWidth,
+                    canvasHeight = canvasHeight,
+                    gains = refinement.gains,
+                    pivotRatio = pivot.ratio,
+                    longitudeSpanDegrees = longitudeSpanDegrees,
+                    centerLongitudeDegrees = centerLongitudeDegrees,
+                    latitudeSpanDegrees = latitudeSpanDegrees,
+                    centerLatitudeDegrees = centerLatitudeDegrees,
+                    onProgress = { completed, total ->
+                        onProgress(StitchProgress(StitchStage.Seaming, completed, total))
+                    },
+                    checkCancelled = { context.ensureActive() },
+                )
+            } else {
+                null
+            }
+            if (BuildConfig.DEBUG && seams != null) {
+                Log.i(
+                    TAG,
+                    "Seam carving: ${seams.gridWidth}x${seams.gridHeight} grid at scale " +
+                        "${seams.scale} over ${prepared.size} frames",
+                )
+            }
+
+            onProgress(StitchProgress(StitchStage.Stitching))
             val rendered = EquirectangularRenderer.render(
                 frames = prepared,
                 canvasWidth = canvasWidth,
                 canvasHeight = canvasHeight,
                 gains = refinement.gains,
+                seams = seams,
                 pivotRatio = pivot.ratio,
                 longitudeSpanDegrees = longitudeSpanDegrees,
                 centerLongitudeDegrees = centerLongitudeDegrees,
@@ -579,6 +681,7 @@ object PhotoSphereStitcher {
             decoded.forEach { it.image.release() }
         }
     }
+    }
 
     /**
      * Canvas width that matches the detail in the frames.
@@ -612,6 +715,9 @@ object PhotoSphereStitcher {
         longitudeSpanDegrees: Float,
         latitudeSpanDegrees: Float,
     ): Int {
+        // Guarded in stitchPhotos too; this keeps the function safe on its own
+        // (a zero span would otherwise compute Infinity -> Int.MAX_VALUE).
+        require(longitudeSpanDegrees > 0f) { "longitude span must be positive" }
         val height = (canvasWidth * latitudeSpanDegrees / longitudeSpanDegrees).roundToInt()
         return height.coerceAtLeast(1)
     }
@@ -622,12 +728,15 @@ object PhotoSphereStitcher {
      *
      * A lens has square pixels, so the focal length the horizontal field of
      * view implies for the frame's width must match the one the vertical field
-     * of view implies for its height. If the angles arrived transposed — the
-     * axes of the sensor rather than of the upright frame — the two implied
-     * focal lengths differ by roughly the square of the aspect ratio (0.56 for
-     * a 4:3 frame), which is far beyond any field-of-view estimation error. The
-     * boundary is drawn at 1 ± 30%: generous enough never to trip on a
-     * loosely-described lens, unambiguous enough that a genuine swap is caught.
+     * of view implies for its height: a correctly-aligned pairing has a
+     * min/max focal ratio of exactly 1. If the angles arrived transposed — the
+     * axes of the sensor rather than of the upright frame — the ratio is the
+     * square of the frame's aspect (0.56 for a 4:3 frame), far beyond any
+     * field-of-view estimation error. The swap boundary sits halfway between
+     * the two in log space — `sqrt(transposed ratio)` — so a pairing is
+     * swapped only when it is closer to the transposed expectation than to the
+     * aligned one, which keeps genuinely asymmetric FOVs (an extreme crop on
+     * one axis) from being mis-swapped by an arbitrary constant.
      *
      * Returns the corrected pair, or null when the angles already match the
      * frame.
@@ -647,9 +756,24 @@ object PhotoSphereStitcher {
         val ratio =
             if (horizontalFocal >= verticalFocal) verticalFocal / horizontalFocal
             else horizontalFocal / verticalFocal
-        if (ratio >= 0.7) return null
+        val aspect = widthPx.toDouble() / heightPx
+        val transposedRatio = if (aspect >= 1.0) 1.0 / (aspect * aspect) else aspect * aspect
+        if (ratio >= sqrt(transposedRatio)) return null
         return verticalFovDegrees to horizontalFovDegrees
     }
+
+    /**
+     * One decoded frame plus whether its EXIF orientation tag was present.
+     *
+     * The tag's *presence* is what lets the decode loop tell "the camera says
+     * this frame is landscape" from "the tag was lost and this is a portrait
+     * frame still in its sensor-native shape". See the rotation fallback in
+     * [stitchPhotos].
+     */
+    private class ReadFrame(
+        val image: Mat,
+        val hasExifOrientation: Boolean,
+    )
 
     /**
      * Decodes one frame into the 8-bit 3-channel matrix the renderer samples.
@@ -660,7 +784,14 @@ object PhotoSphereStitcher {
      * otherwise hand the renderer a mix of portrait and landscape frames while
      * the field of view describes only one of them.
      */
-    private fun readFrame(file: File, maxDimension: Int): Mat {
+    private fun readFrame(file: File, maxDimension: Int): ReadFrame {
+        // Read the tag's presence before decoding: ExifInterface.getAttributeInt
+        // cannot distinguish a present NORMAL tag from a missing one, and the
+        // rotation fallback depends on that distinction.
+        val hasExifOrientation = runCatching {
+            ExifInterface(file).getAttribute(ExifInterface.TAG_ORIENTATION) != null
+        }.getOrDefault(false)
+
         val bitmap = decodeUpright(file, maxDimension)
             ?: throw StitchException(
                 StitchStatus.UnreadableInput,
@@ -679,7 +810,7 @@ object PhotoSphereStitcher {
             rgba.release()
             bitmap.recycle()
         }
-        return rgb
+        return ReadFrame(rgb, hasExifOrientation)
     }
 
     /**
@@ -711,7 +842,13 @@ object PhotoSphereStitcher {
     /** Copies the finished canvas out into a bitmap the UI can show. */
     private fun toBitmap(canvas: Mat): Bitmap {
         val bitmap = Bitmap.createBitmap(canvas.cols(), canvas.rows(), Bitmap.Config.ARGB_8888)
-        Utils.matToBitmap(canvas, bitmap)
+        try {
+            Utils.matToBitmap(canvas, bitmap)
+        } catch (e: Throwable) {
+            // A malformed canvas must not leak the bitmap it was about to fill.
+            bitmap.recycle()
+            throw e
+        }
         return bitmap
     }
 
@@ -852,9 +989,15 @@ object PhotoSphereStitcher {
             else -> return bitmap
         }
 
-        val rotated = Bitmap.createBitmap(
-            bitmap, 0, 0, bitmap.width, bitmap.height, matrix, /* filter = */ true,
-        )
+        val rotated = try {
+            Bitmap.createBitmap(
+                bitmap, 0, 0, bitmap.width, bitmap.height, matrix, /* filter = */ true,
+            )
+        } catch (e: Throwable) {
+            // An allocation failure must not leak the decoded source bitmap.
+            bitmap.recycle()
+            throw e
+        }
         if (rotated !== bitmap) bitmap.recycle()
         return rotated
     }

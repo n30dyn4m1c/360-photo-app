@@ -24,6 +24,16 @@ import androidx.camera.camera2.interop.Camera2Interop
  * re-focuses mid-sweep. This is the same model GCam's Photosphere uses: lock
  * exposure and focus, then sweep.
  *
+ * The one rule the locks observe: they are applied only *after* the 3A has
+ * converged on the scene the phone is pointed at. Locking from the stream's
+ * first frame pins the exposure at the HAL's stream-start defaults — a short
+ * exposure and low ISO chosen for a bright scene — which leaves a dark scene
+ * permanently black: the viewfinder never brightens and every frame records a
+ * black image. The session starts unlocked, waits for AE/AWB to converge (the
+ * exposure ramps up over the first moments in low light), and locks to the
+ * values they settled on. See [applyStillImageOptions] and
+ * PhotoSphereCameraScreen's convergence callback.
+ *
  * The one thing that varies per device is *how* focus is fixed:
  *
  * - [FocusMode.FOCUS_POINT] — the default for any lens that can focus. The
@@ -95,6 +105,11 @@ internal fun resolveOpticalStabilization(stabilizationModes: IntArray?): Boolean
 /**
  * The capture profile for this device's rear camera.
  *
+ * [cameraId] pins the profile to a specific lens (the one that actually bound,
+ * once known); without it the profile is resolved for the lens the device
+ * profile would bind, which is the right answer until a fallback changes the
+ * lens.
+ *
  * Deliberately does not throw: a camera that will not describe itself gets the
  * most conservative profile (locks everything, tap-to-focus on the first scene)
  * rather than failing capture.
@@ -102,9 +117,16 @@ internal fun resolveOpticalStabilization(stabilizationModes: IntArray?): Boolean
 internal fun resolveSphereCaptureProfile(
     context: Context,
     profile: SphereDeviceProfile,
+    cameraId: String? = null,
 ): SphereCaptureProfile {
-    val characteristics =
-        runCatching { backCameraCharacteristics(context, profile) }.getOrNull()
+    val characteristics = runCatching {
+        if (cameraId != null) {
+            context.getSystemService(CameraManager::class.java)
+                ?.getCameraCharacteristics(cameraId)
+        } else {
+            backCameraCharacteristics(context, profile)
+        }
+    }.getOrNull()
     return SphereCaptureProfile(
         focusMode = resolveFocusMode(
             minimumFocusDistance =
@@ -201,30 +223,17 @@ private fun backCameraCharacteristics(context: Context, profile: SphereDevicePro
 }
 
 /**
- * Applies the 3A locks to a use case's requests.
+ * Applies the focus strategy to a use case's requests.
  *
  * This is deliberately applied to *both* the Preview and ImageCapture builders:
- * the preview is the session's repeating request, and a lock lives there for
- * the whole session — AE pinned to the exposure it converged on, AWB pinned to
- * the colour temperature, focus parked — so the viewfinder shows exactly what
- * each frame will record and no frame is allowed to re-meter on its own. The
- * still requests carry the same locks so they cannot deviate even if the
- * repeating request were interrupted.
+ * the preview is the session's repeating request and the stills must agree with
+ * it. AE and AWB locks are *not* set here — see [applyStillImageOptions] for
+ * where they live and why they are deferred.
  */
 internal fun applySphereCaptureOptions(
     extender: Camera2Interop.Extender<*>,
     profile: SphereCaptureProfile,
 ) {
-    // AE lock holds the ISO and shutter speed the HAL converged on; AWB lock
-    // holds the colour temperature. Together they make every frame of the
-    // sphere identical in brightness and tint. The HAL still runs its initial
-    // convergence, then holds.
-    if (profile.aeLockSupported) {
-        extender.setCaptureRequestOption(CaptureRequest.CONTROL_AE_LOCK, true)
-    }
-    if (profile.awbLockSupported) {
-        extender.setCaptureRequestOption(CaptureRequest.CONTROL_AWB_LOCK, true)
-    }
     when (profile.focusMode) {
         FocusMode.FIXED_FOCUS -> {
             extender.setCaptureRequestOption(
@@ -248,12 +257,28 @@ internal fun applySphereCaptureOptions(
  * Applies options that belong on the still-image requests only.
  *
  * OIS is the lens steadying the shot; it belongs on the capture, not the
- * preview.
+ * preview. AE and AWB locks belong here too, but only as a safety net: the
+ * session locks them on the repeating request once the 3A has converged, and a
+ * still fired mid-convergence must not re-meter on its own — the lock pins it
+ * to whatever the converging repeating request has reached, so a premature
+ * capture cannot walk away from the exposure the viewfinder is showing. The
+ * initial convergence itself is left to run, because locking the very first
+ * request freezes the exposure at the HAL's stream-start defaults and a dark
+ * scene would never brighten.
  */
 internal fun applyStillImageOptions(
     extender: Camera2Interop.Extender<*>,
     profile: SphereCaptureProfile,
 ) {
+    // AE lock holds the ISO and shutter speed, AWB lock holds the colour
+    // temperature; together they keep every frame of the sphere identical in
+    // brightness and tint.
+    if (profile.aeLockSupported) {
+        extender.setCaptureRequestOption(CaptureRequest.CONTROL_AE_LOCK, true)
+    }
+    if (profile.awbLockSupported) {
+        extender.setCaptureRequestOption(CaptureRequest.CONTROL_AWB_LOCK, true)
+    }
     if (profile.opticalStabilizationSupported) {
         extender.setCaptureRequestOption(
             CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,

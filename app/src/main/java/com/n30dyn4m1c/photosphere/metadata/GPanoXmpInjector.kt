@@ -9,6 +9,8 @@ import java.io.FileOutputStream
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import kotlin.math.roundToInt
 
 /**
@@ -102,10 +104,19 @@ data class GPanoMetadata(
         ): GPanoMetadata {
             require(longitudeSpanDegrees in 1f..360f) { "longitude span: $longitudeSpanDegrees" }
             require(latitudeSpanDegrees in 1f..180f) { "latitude span: $latitudeSpanDegrees" }
+            require(centerLatitudeDegrees in -90f..90f) {
+                "centre latitude: $centerLatitudeDegrees"
+            }
             val fullWidth = (imageWidth * 360f / longitudeSpanDegrees).roundToInt()
             val fullHeight = (imageHeight * 180f / latitudeSpanDegrees).roundToInt()
-            val left = ((centerLongitudeDegrees + 180f) / 360f * fullWidth).roundToInt() -
-                imageWidth / 2
+            // Longitude is periodic: a centre of 180° describes the same sphere
+            // as -180°, and folding the centre into [-180, 180) keeps the
+            // cropped rectangle inside the full-pano bounds. (The cropped area
+            // is a *rectangle* in equirectangular space, so a region straddling
+            // the ±180° seam has to be expressed on one side of it — the same
+            // unwrap the canvas itself performs.)
+            val center = ((centerLongitudeDegrees + 180f) % 360f + 360f) % 360f - 180f
+            val left = ((center + 180f) / 360f * fullWidth).roundToInt() - imageWidth / 2
             val top = ((90f - centerLatitudeDegrees - latitudeSpanDegrees / 2f) / 180f * fullHeight)
                 .roundToInt()
             return GPanoMetadata(
@@ -113,8 +124,11 @@ data class GPanoMetadata(
                 fullPanoHeightPixels = fullHeight,
                 croppedAreaImageWidthPixels = imageWidth,
                 croppedAreaImageHeightPixels = imageHeight,
-                croppedAreaLeftPixels = left.coerceAtLeast(0),
-                croppedAreaTopPixels = top.coerceAtLeast(0),
+                // The clamps are rounding guards: the maths above keeps the
+                // rectangle inside the sphere, but a round at the edge could
+                // still land one pixel past it.
+                croppedAreaLeftPixels = left.coerceIn(0, (fullWidth - imageWidth).coerceAtLeast(0)),
+                croppedAreaTopPixels = top.coerceIn(0, (fullHeight - imageHeight).coerceAtLeast(0)),
             )
         }
     }
@@ -211,10 +225,13 @@ object GPanoXmpInjector {
             }
             if (!temp.renameTo(file)) {
                 // Some filesystems refuse to rename onto an existing name. The
-                // original is fully readable until this point, so the window
-                // where neither file is in place is a single syscall wide.
-                if (!file.delete() || !temp.renameTo(file)) {
-                    throw IOException("Could not move ${temp.name} onto ${file.name}")
+                // original is fully readable until this point; replace it
+                // atomically rather than delete-then-rename, which would open a
+                // window where neither copy exists if the second call failed.
+                try {
+                    Files.move(temp.toPath(), file.toPath(), StandardCopyOption.REPLACE_EXISTING)
+                } catch (e: IOException) {
+                    throw IOException("Could not move ${temp.name} onto ${file.name}", e)
                 }
             }
             file

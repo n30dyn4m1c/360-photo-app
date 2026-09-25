@@ -1,11 +1,8 @@
 package com.n30dyn4m1c.photosphere.storage
 
-import android.content.ContentValues
 import android.content.Context
 import android.graphics.Bitmap
 import android.net.Uri
-import android.os.Build
-import android.provider.MediaStore
 import android.util.Log
 import androidx.camera.core.ImageCapture
 import androidx.core.content.FileProvider
@@ -15,6 +12,8 @@ import com.n30dyn4m1c.photosphere.metadata.GPanoXmpInjector
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -41,6 +40,9 @@ object SphereImageStore {
     private const val ALBUM = "PhotoSphere"
     private const val MIME_TYPE = "image/jpeg"
 
+    /** File-name prefix of finished spheres, for the stale sweep. */
+    private const val SPHERE_FILE_PREFIX = "sphere_"
+
     /** Cache subdirectory holding one directory per capture session. */
     private const val SESSIONS_DIRECTORY = "sphere_sessions"
 
@@ -53,18 +55,15 @@ object SphereImageStore {
      */
     private const val SPHERES_DIRECTORY = "spheres"
 
+    /** Public name of the spheres cache directory, for the application-level prune. */
+    const val SPHERES_DIRECTORY_NAME = SPHERES_DIRECTORY
+
     /**
      * Encode quality for the finished sphere. High, because this is the only
      * image of the run that is kept and it has already been through one
      * generation of JPEG on the way in.
      */
     private const val SPHERE_JPEG_QUALITY = 95
-
-    /** Output options plus the display name they will produce. */
-    data class FrameOutputRequest(
-        val outputOptions: ImageCapture.OutputFileOptions,
-        val displayName: String,
-    )
 
     /** Output options plus the cache file they will write to. */
     data class TempFrameRequest(
@@ -90,8 +89,12 @@ object SphereImageStore {
     )
 
     /** Identifier for one run of guided capture. Sorts chronologically. */
-    fun newSessionId(): String =
-        SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+    fun newSessionId(): String {
+        // Millisecond precision: the manager is recreated on configuration
+        // changes, and two sessions born in the same second would share a
+        // directory and silently mix their frames.
+        return SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
+    }
 
     /**
      * Directory holding the frames of [sessionId], created if needed.
@@ -103,8 +106,15 @@ object SphereImageStore {
      *
      * Touches the filesystem — call off the main thread.
      */
-    fun sessionDirectory(context: Context, sessionId: String): File =
-        File(File(context.cacheDir, SESSIONS_DIRECTORY), sessionId).apply { mkdirs() }
+    fun sessionDirectory(context: Context, sessionId: String): File {
+        val directory = File(File(context.cacheDir, SESSIONS_DIRECTORY), sessionId)
+        if (!directory.exists() && !directory.mkdirs()) {
+            // A failure here surfaces later as a baffling CameraX "no such file"
+            // write error; an early, specific one is worth more.
+            throw IOException("Could not create session directory ${directory.path}")
+        }
+        return directory
+    }
 
     /** Path frame [index] of a session occupies. Zero-padded so it sorts. */
     fun frameFile(directory: File, index: Int): File =
@@ -215,32 +225,6 @@ object SphereImageStore {
         }
     }
 
-    fun newFrameOutputOptions(context: Context, index: Int): FrameOutputRequest {
-        val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-        val displayName = "sphere_%s_%03d.jpg".format(timestamp, index)
-
-        val values = ContentValues().apply {
-            put(MediaStore.Images.Media.DISPLAY_NAME, displayName)
-            put(MediaStore.Images.Media.MIME_TYPE, MIME_TYPE)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                // Scoped storage: the system picks the real path from this hint.
-                // IS_PENDING is intentionally not set here — CameraX's ImageSaver
-                // raises and clears it around the write on its own.
-                put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/$ALBUM")
-            }
-        }
-
-        val outputOptions = ImageCapture.OutputFileOptions
-            .Builder(
-                context.contentResolver,
-                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-                values,
-            )
-            .build()
-
-        return FrameOutputRequest(outputOptions, displayName)
-    }
-
     /**
      * Encodes a finished equirectangular sphere into the cache as a 360 photo.
      *
@@ -260,8 +244,11 @@ object SphereImageStore {
      * marker that makes viewers treat this as a sphere is written by the last
      * thing to touch the file. Neither pass re-encodes the image.
      *
-     * A sphere left over from an earlier run is deleted first: only one is ever
-     * in play, and each is several megabytes.
+     * The new sphere is built up under a temporary name and moved onto its final
+     * name only once it is complete. The previous sphere is cleared *after* that
+     * swap, so a failed encode or metadata pass never destroys the last good
+     * output — the user keeps the older sphere instead of being left with
+     * nothing. Only one sphere is ever in play, and each is several megabytes.
      *
      * Blocking I/O and a full-size compress — call off the main thread. Throws
      * [IOException] if the encode fails.
@@ -273,31 +260,51 @@ object SphereImageStore {
         gpano: GPanoMetadata = GPanoMetadata.forFullPano(bitmap.width, bitmap.height),
     ): StitchedSphere {
         val directory = spheresDirectory(context)
-        directory.listFiles()?.forEach { stale ->
-            if (!stale.delete()) Log.w(TAG, "Could not clear stale sphere ${stale.name}")
-        }
 
         val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
         val file = File(directory, "sphere_%s.jpg".format(timestamp))
+        val temp = File(directory, file.name + ".tmp")
 
         try {
-            FileOutputStream(file).use { out ->
+            FileOutputStream(temp).use { out ->
                 if (!bitmap.compress(Bitmap.CompressFormat.JPEG, quality, out)) {
                     throw IOException("Could not encode the stitched sphere")
                 }
             }
+            stampSphereDescription(temp)
+            GPanoXmpInjector.inject(temp, gpano)
+                .onFailure { error ->
+                    // Recoverable: the file is a valid 2:1 JPEG either way, it
+                    // will simply open flat instead of as a sphere.
+                    Log.w(TAG, "Could not write GPano metadata for ${file.name}", error)
+                }
+            // The new sphere is complete; move it into place (atomically — the
+            // name is fresh, but REPLACE_EXISTING also absorbs a same-second
+            // collision) and only then drop the previous one.
+            try {
+                Files.move(temp.toPath(), file.toPath(), StandardCopyOption.REPLACE_EXISTING)
+            } catch (e: IOException) {
+                Log.w(TAG, "Could not finalise ${file.name}", e)
+                throw e
+            }
         } catch (e: Exception) {
-            file.delete()
+            temp.delete()
             throw e
         }
 
-        stampSphereDescription(file)
-        GPanoXmpInjector.inject(file, gpano)
-            .onFailure { error ->
-                // Recoverable: the file is a valid 2:1 JPEG either way, it will
-                // simply open flat instead of as a sphere.
-                Log.w(TAG, "Could not write GPano metadata for ${file.name}", error)
+        // The previous sphere is cleared now the new one is complete. Only the
+        // final-name pattern is swept: a `.tmp` beside the new file belongs to
+        // whatever is still writing it (or a crashed run, which the cache
+        // reclaims), and deleting it mid-write would corrupt that run.
+        directory.listFiles()?.forEach { stale ->
+            if (stale != file &&
+                stale.name.startsWith(SPHERE_FILE_PREFIX) &&
+                stale.name.endsWith(".jpg") &&
+                !stale.delete()
+            ) {
+                Log.w(TAG, "Could not clear stale sphere ${stale.name}")
             }
+        }
 
         return StitchedSphere(file = file, width = bitmap.width, height = bitmap.height)
     }
@@ -325,7 +332,14 @@ object SphereImageStore {
         }
     }
 
-    /** Marks a finished sphere as this app's output, in EXIF. */
+    /**
+     * Marks a finished sphere as this app's output, in EXIF.
+     *
+     * Note: the "this is a 360 photo" marker that Google Photos and other
+     * viewers look for is XMP GPano, not EXIF, and [ExifInterface] cannot write
+     * XMP — that marker is [GPanoXmpInjector]'s job, on the same file, after
+     * this pass.
+     */
     private fun stampSphereDescription(file: File) {
         try {
             ExifInterface(file).apply {
@@ -341,41 +355,4 @@ object SphereImageStore {
             Log.w(TAG, "Could not write EXIF for ${file.name}", e)
         }
     }
-
-    /**
-     * Stamps identifying EXIF tags onto a saved frame.
-     *
-     * CameraX already writes orientation and the capture timestamp; this adds the
-     * album/sequence markers the stitcher uses to group a run of frames.
-     *
-     * Note: the "this is a 360 photo" marker that Google Photos and other viewers
-     * look for is XMP GPano, not EXIF, and [ExifInterface] cannot write XMP.
-     * That marker belongs on the stitched sphere rather than on a frame, and
-     * [GPanoXmpInjector] is what writes it.
-     */
-    fun stampSphereMetadata(context: Context, uri: Uri, index: Int) {
-        try {
-            context.contentResolver.openFileDescriptor(uri, "rw")?.use { descriptor ->
-                ExifInterface(descriptor.fileDescriptor).apply {
-                    setAttribute(ExifInterface.TAG_SOFTWARE, "PhotoSphere")
-                    setAttribute(ExifInterface.TAG_IMAGE_DESCRIPTION, "$ALBUM frame $index")
-                    saveAttributes()
-                }
-            }
-        } catch (e: Exception) {
-            // Metadata is a nice-to-have; never lose the frame over it.
-            Log.w(TAG, "Could not write EXIF for $uri", e)
-        }
-    }
-
-    /** Reads back the orientation CameraX recorded for a frame. */
-    fun readOrientation(context: Context, uri: Uri): Int =
-        runCatching {
-            context.contentResolver.openInputStream(uri)?.use { stream ->
-                ExifInterface(stream).getAttributeInt(
-                    ExifInterface.TAG_ORIENTATION,
-                    ExifInterface.ORIENTATION_NORMAL,
-                )
-            } ?: ExifInterface.ORIENTATION_NORMAL
-        }.getOrDefault(ExifInterface.ORIENTATION_NORMAL)
 }

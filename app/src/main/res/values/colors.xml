@@ -1,5 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <color name="sphere_background">#FF101418</color>
+    <!--
+        The window background the platform paints before Compose takes over.
+        Must stay in step with SphereBackground in ui/theme/Color.kt: any
+        difference between the two shows up as a flash of the wrong dark on
+        every cold start.
+    -->
+    <color name="sphere_background">#FF0A0D10</color>
     <color name="ic_launcher_background">#FF0B3D5C</color>
 </resources>

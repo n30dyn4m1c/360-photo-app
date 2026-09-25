@@ -6,14 +6,14 @@ plugins {
 
 android {
     namespace = "com.n30dyn4m1c.photosphere"
-    compileSdk = 35
+    compileSdk = 37
 
     defaultConfig {
         applicationId = "com.n30dyn4m1c.photosphere"
         // 26 keeps adaptive launcher icons, ART, and the modern camera2 pipeline
         // available without legacy fallbacks. CameraX itself supports 21+.
         minSdk = 26
-        targetSdk = 35
+        targetSdk = 37
         versionCode = 1
         versionName = "0.1.0"
 
@@ -111,6 +111,7 @@ dependencies {
     testImplementation(libs.kotlinx.coroutines.test)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
+    androidTestImplementation(libs.androidx.test.rules)
     androidTestImplementation(platform(libs.androidx.compose.bom))
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)
 }

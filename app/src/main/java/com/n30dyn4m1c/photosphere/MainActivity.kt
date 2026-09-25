@@ -5,23 +5,33 @@ import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Color
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.systemBarsPadding
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.PhotoCamera
 import androidx.compose.material3.Button
 import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
@@ -36,6 +46,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextAlign
@@ -48,6 +59,7 @@ import com.n30dyn4m1c.photosphere.sensor.OrientationDebugScreen
 import com.n30dyn4m1c.photosphere.storage.SphereImageStore
 import com.n30dyn4m1c.photosphere.storage.SphereImageStore.StitchedSphere
 import com.n30dyn4m1c.photosphere.ui.theme.PhotoSphereTheme
+import com.n30dyn4m1c.photosphere.ui.theme.PillShape
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.launch
@@ -56,7 +68,17 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        enableEdgeToEdge()
+        // Both bars stay transparent over the viewfinder, and both are forced to
+        // *light* icons. The default follows the system's day/night setting,
+        // which on a phone in light mode paints dark status-bar icons — over a
+        // black viewfinder, or a night scene, that is a clock nobody can read.
+        // The app's own scheme is dark in every configuration (see
+        // PhotoSphereTheme), so the bars are pinned to match it rather than the
+        // system.
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.dark(Color.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.dark(Color.TRANSPARENT),
+        )
         setContent {
             PhotoSphereTheme {
                 Surface(
@@ -171,7 +193,7 @@ private fun PhotoSphereApp(modifier: Modifier = Modifier) {
 }
 
 /** Where the user currently stands with a set of runtime permissions. */
-private enum class PermissionStatus {
+internal enum class PermissionStatus {
     /** Not asked yet, or the system will show the dialog on the next request. */
     Unknown,
 
@@ -183,6 +205,38 @@ private enum class PermissionStatus {
 
     /** Denied with "don't ask again" (or blocked by policy) — only Settings helps. */
     PermanentlyDenied,
+}
+
+/**
+ * The verdict after a runtime-permission request returns.
+ *
+ * Extracted from the launcher callback so the state machine can be pinned by
+ * unit tests. The decision deliberately reads the *grants*, not the result
+ * map, and treats an empty map as a cancellation, not a grant:
+ *
+ * - Asked of the system, not inferred from `results`. When the dialog is
+ *   dismissed without an answer — a swipe away, a phone call taking the
+ *   foreground, the screen locking — the contract delivers an *empty* map, and
+ *   `emptyMap().values.all { }` is vacuously true. Read straight from the map,
+ *   that cancellation would have counted as a grant and dropped the user into
+ *   a camera screen with no camera permission, where the bind fails and the
+ *   viewfinder is simply black.
+ * - A real denial the system will still show a dialog for, or that same
+ *   cancellation, both land in [PermissionStatus.ShowRationale]. The retry is
+ *   what matters: `shouldShowRationale` reads false after a cancel, so trusting
+ *   it here would send someone who never answered the dialog off to the
+ *   Settings app to fix a setting they had not touched. Only an explicit
+ *   "deny" that the system will no longer surface a dialog for earns that trip.
+ */
+internal fun resolvePermissionStatus(
+    results: Map<String, Boolean>,
+    hasAll: Boolean,
+    anyShouldShowRationale: Boolean,
+): PermissionStatus = when {
+    hasAll -> PermissionStatus.Granted
+    results.isEmpty() -> PermissionStatus.ShowRationale
+    anyShouldShowRationale -> PermissionStatus.ShowRationale
+    else -> PermissionStatus.PermanentlyDenied
 }
 
 /**
@@ -211,19 +265,21 @@ private fun RequirePermissions(
             }
         )
     }
-    var hasRequested by remember { mutableStateOf(false) }
+    // Saveable so an activity recreation (font scale, dark mode, foldable
+    // resize) does not re-fire the system dialog at a user who already answered
+    // it — a permanently-denied user would get a silent no-op request, and a
+    // merely-denied one an unprompted dialog.
+    var hasRequested by rememberSaveable { mutableStateOf(false) }
 
     val launcher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { results ->
-        status = when {
-            results.values.all { it } -> PermissionStatus.Granted
-            // The dialog is still available => the user simply said no this time.
-            activity != null && permissions.any(activity::shouldShowRationale) ->
-                PermissionStatus.ShowRationale
-
-            else -> PermissionStatus.PermanentlyDenied
-        }
+        status = resolvePermissionStatus(
+            results = results,
+            hasAll = context.hasAllPermissions(permissions),
+            anyShouldShowRationale = activity != null &&
+                permissions.any(activity::shouldShowRationale),
+        )
     }
 
     // Ask once, automatically, the first time the gate is shown.
@@ -268,6 +324,15 @@ private fun RequirePermissions(
     }
 }
 
+/**
+ * The permission gate's own screen.
+ *
+ * This is the app's front door — for a first-time user it is the whole app
+ * until they say yes — so it is composed rather than dumped: the lens glyph
+ * gives the request a subject, the title carries the ask, and the body explains
+ * why a camera app that never uploads anything still needs the camera. The
+ * action, when there is one, is full-width at the bottom where a thumb is.
+ */
 @Composable
 private fun PermissionMessage(
     message: String,
@@ -275,32 +340,62 @@ private fun PermissionMessage(
     onAction: (() -> Unit)?,
     modifier: Modifier = Modifier,
 ) {
-    Scaffold(modifier = modifier.fillMaxSize()) { insets ->
+    Scaffold(
+        modifier = modifier.fillMaxSize(),
+        containerColor = MaterialTheme.colorScheme.background,
+    ) { insets ->
         Column(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(insets)
-                .padding(24.dp),
+                .padding(horizontal = 32.dp, vertical = 24.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center,
         ) {
+            // A ring around the lens glyph, echoing the capture reticle the user
+            // is about to spend the next few minutes aiming.
+            Box(
+                modifier = Modifier
+                    .size(88.dp)
+                    .clip(CircleShape)
+                    .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    imageVector = Icons.Outlined.PhotoCamera,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(38.dp),
+                )
+            }
+
             Text(
+                modifier = Modifier.padding(top = 28.dp),
                 text = stringResource(R.string.permission_camera_title),
                 style = MaterialTheme.typography.headlineSmall,
+                color = MaterialTheme.colorScheme.onBackground,
                 textAlign = TextAlign.Center,
             )
             Text(
                 modifier = Modifier.padding(top = 12.dp),
                 text = message,
                 style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
                 textAlign = TextAlign.Center,
             )
             if (actionLabel != null && onAction != null) {
                 Button(
-                    modifier = Modifier.padding(top = 24.dp),
+                    modifier = Modifier
+                        .padding(top = 32.dp)
+                        .fillMaxWidth()
+                        .height(54.dp),
+                    shape = PillShape,
                     onClick = onAction,
                 ) {
-                    Text(actionLabel)
+                    Text(
+                        text = actionLabel,
+                        style = MaterialTheme.typography.titleMedium,
+                    )
                 }
             }
         }

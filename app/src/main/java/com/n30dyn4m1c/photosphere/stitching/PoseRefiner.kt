@@ -30,11 +30,17 @@ internal class DecodedFrame(
  * gains that equalise the overlaps. [matchedEdges] is how many pose-graph edges
  * were actually measured against image content; zero means the sensor did all
  * the work and the output is a plain orientation-driven stitch.
+ *
+ * [focalScales] holds one focal-length multiplier per frame, aligned by position
+ * with [bases]: 1.0 when the measured field of view needs no correction, or
+ * when nothing matched and there was no content to measure against. The
+ * stitcher applies it to each frame's intrinsics before rendering.
  */
 internal data class RefinementResult(
     val bases: List<CameraBasis>,
     val gains: FloatArray,
     val matchedEdges: Int,
+    val focalScales: DoubleArray,
 )
 
 /**
@@ -49,10 +55,21 @@ internal data class RefinementResult(
  * top of the measured pose — the sensor stays the anchor, and the pixels decide
  * the fine alignment.
  *
+ * The same correspondences also sharpen the *field of view*. A focal-length
+ * error pulls every bearing radially about its optical axis, so the residual
+ * the rotations leave behind carries a measure of it; a per-frame focal scale
+ * is solved from the matched bearings by least squares ([RotationMath.refineFocalLengths])
+ * and handed back with the poses, and the stitcher projects through the
+ * corrected focal lengths. Frame 0 is anchored — rotation averaging already
+ * fixes it, and the whole sphere may be uniformly scaled without changing any
+ * alignment, so the absolute scale is only defined relative to the frame that
+ * is held still.
+ *
  * Nothing here is allowed to make a stitch *worse*: every edge is checked
  * against the sensor-relative rotation it should be near, frames with no
- * reliable matches keep their sensor pose, and if nothing matches at all the
- * whole pass hands the sensor rotations straight back.
+ * reliable matches keep their sensor pose and their reported focal length, and
+ * if nothing matches at all the whole pass hands the sensor rotations straight
+ * back.
  */
 internal object PoseRefiner {
 
@@ -94,6 +111,39 @@ internal object PoseRefiner {
     /** Gauss–Seidel sweeps over the pose graph. */
     private const val AVERAGE_ITERATIONS = 8
 
+    /**
+     * Below this many matched feature correspondences the focal correction is
+     * not worth solving for.
+     *
+     * The solve needs enough bearings spread across the frame to separate a
+     * genuine focal-scale error from feature-location noise; a handful of
+     * matches from a low-texture scene would happily explain themselves as a
+     * focal shift, so below this floor the reported field of view is kept.
+     */
+    const val MIN_FOCAL_CORRESPONDENCES = 40
+
+    /**
+     * Largest focal correction a frame is allowed to take, as a fraction.
+     *
+     * A lens that genuinely wanted a bigger correction would be a badly
+     * described device, and a bad solve must not be allowed to rescale a frame
+     * enough to open gaps its neighbours cannot close. 15% is an order of
+     * magnitude more than the residual scale error a loosely-described lens
+     * leaves behind.
+     */
+    const val MAX_FOCAL_CORRECTION = 0.15
+
+    /**
+     * Gauss–Newton passes over the focal correction.
+     *
+     * Each pass re-linearises the residuals around the current estimate and
+     * re-solves; two passes absorb most of the nonlinearity a multi-degree
+     * correction leaves behind. The rotations stay put between passes — the
+     * focal shift is a second-order correction to them — so each pass is just a
+     * rebuild of the correspondences and one solve.
+     */
+    private const val FOCAL_ITERATIONS = 3
+
     fun refine(
         frames: List<DecodedFrame>,
         horizontalFovDegrees: Float,
@@ -109,6 +159,9 @@ internal object PoseRefiner {
         val emptyMask = Mat()
         val features = frames.map { extractFeatures(it, orb, emptyMask, pivotRatio) }
         val acceptedEdges = ArrayList<RotationMath.RotationEdge>()
+        // The inlier match indices of each accepted edge, kept in the same order
+        // as [acceptedEdges] so the focal solve knows which pixels to re-project.
+        val edgeInliers = ArrayList<List<Pair<Int, Int>>>()
         // One matcher for the whole pass: `create` builds a native object, and
         // the pose graph asks it for a hundred-odd pairs.
         val matcher = DescriptorMatcher.create(DescriptorMatcher.BRUTEFORCE_HAMMING)
@@ -144,6 +197,7 @@ internal object PoseRefiner {
                                 rotation = estimate.rotation,
                                 weight = estimate.inlierCount.toDouble(),
                             )
+                            edgeInliers += estimate.inliers.map { matches[it] }
                         }
                     }
                 }
@@ -162,7 +216,16 @@ internal object PoseRefiner {
             val meanLuma = DoubleArray(frames.size) { features[it].meanLuma }
             val gains = ExposureCompensation.solveGains(meanLuma, candidateEdges)
 
-            return RefinementResult(refined, gains, acceptedEdges.size)
+            val focalScales = solveFocalScales(
+                frames = frames,
+                features = features,
+                edges = acceptedEdges,
+                edgeInliers = edgeInliers,
+                refinedRotations = refined.map { it.toRotationMatrix() },
+                pivotRatio = pivotRatio,
+            )
+
+            return RefinementResult(refined, gains, acceptedEdges.size, focalScales)
         } finally {
             features.forEach { it.descriptors.release() }
             matcher.clear()
@@ -173,6 +236,14 @@ internal object PoseRefiner {
 
     private class FrameFeatures(
         val bearings: List<DoubleArray>,
+        /**
+         * The undistorted (ideal pinhole) pixel of each keypoint, aligned by
+         * position with [bearings]. The bearing is the same information in
+         * angular form under the *assumed* focal length; the pixel is what lets
+         * the focal solve re-project the keypoint through a corrected one
+         * without re-running ORB.
+         */
+        val idealPixels: List<DoubleArray>,
         val descriptors: Mat,
         val meanLuma: Double,
     )
@@ -229,6 +300,7 @@ internal object PoseRefiner {
 
             val basis = frame.sensorBasis
             val bearings = ArrayList<DoubleArray>(keypoints.rows())
+            val idealPixels = ArrayList<DoubleArray>(keypoints.rows())
             for (kp in keypoints.toArray()) {
                 val u = kp.pt.x * scaleX
                 val v = kp.pt.y * scaleY
@@ -237,6 +309,7 @@ internal object PoseRefiner {
                 } else {
                     doubleArrayOf(u, v)
                 }
+                idealPixels += ideal
                 var x = (ideal[0] - cx) / fx
                 var y = -(ideal[1] - cy) / fy
                 val length = Math.sqrt(x * x + y * y + 1.0)
@@ -250,7 +323,7 @@ internal object PoseRefiner {
                 }
             }
 
-            return FrameFeatures(bearings, descriptors, Core.mean(small).`val`[0])
+            return FrameFeatures(bearings, idealPixels, descriptors, Core.mean(small).`val`[0])
         } finally {
             gray.release()
             small.release()
@@ -280,6 +353,186 @@ internal object PoseRefiner {
             basis.lateralOf(fromPivot[0], fromPivot[1], fromPivot[2]),
             basis.verticalOf(fromPivot[0], fromPivot[1], fromPivot[2]),
             basis.depthOf(fromPivot[0], fromPivot[1], fromPivot[2]),
+        )
+    }
+
+    /**
+     * The focal-correction solve: one per-frame scale, or all ones when there
+     * is nothing to measure against.
+     *
+     * The scale describes the lens the *feature matches* saw, which is why a
+     * matchless run keeps the reported field of view: a correction with no
+     * content behind it is a guess. The rotations from the pose graph are the
+     * starting point, but the solve itself never touches them directly — each
+     * correspondence carries its edge's rotation already baked into the
+     * transformed bearing, so a rebuild of the correspondences is all a
+     * Gauss–Newton pass needs.
+     */
+    private fun solveFocalScales(
+        frames: List<DecodedFrame>,
+        features: List<FrameFeatures>,
+        edges: List<RotationMath.RotationEdge>,
+        edgeInliers: List<List<Pair<Int, Int>>>,
+        refinedRotations: List<DoubleArray>,
+        pivotRatio: Double,
+    ): DoubleArray {
+        val scales = DoubleArray(frames.size) { 1.0 }
+        if (edges.isEmpty()) return scales
+        if (edgeInliers.sumOf { it.size } < MIN_FOCAL_CORRESPONDENCES) return scales
+
+        // The relative rotations the rendering will actually use — smoother
+        // than the raw RANSAC edges, since rotation averaging has already
+        // spread each measurement across the graph.
+        val relative = edges.map { edge ->
+            RotationMath.multiply(
+                RotationMath.transpose(refinedRotations[edge.to]),
+                refinedRotations[edge.from],
+            )
+        }
+
+        val logScale = DoubleArray(frames.size)
+        repeat(FOCAL_ITERATIONS) {
+            val correspondences = buildFocalCorrespondences(
+                frames = frames,
+                features = features,
+                edges = edges,
+                edgeInliers = edgeInliers,
+                relativeRotations = relative,
+                pivotRatio = pivotRatio,
+                scales = scales,
+            )
+            val delta = RotationMath.refineFocalLengths(
+                correspondences, frames.size, maxCorrection = MAX_FOCAL_CORRECTION,
+            )
+            for (frame in frames.indices) logScale[frame] += delta[frame]
+            for (frame in frames.indices) scales[frame] = Math.exp(logScale[frame])
+        }
+        // The per-pass clamp bounds each step, but the steps accumulate; clamp
+        // the total too so a pathological solve still cannot rescale a frame
+        // beyond the safety limit.
+        for (frame in frames.indices) {
+            logScale[frame] = logScale[frame].coerceIn(-MAX_FOCAL_CORRECTION, MAX_FOCAL_CORRECTION)
+            scales[frame] = Math.exp(logScale[frame])
+        }
+        return scales
+    }
+
+    /**
+     * The [RotationMath.FocalCorrespondence]s the accepted edges imply, with
+     * bearings and derivatives evaluated at [scales].
+     *
+     * Each inlier of each edge becomes one correspondence: the *from* bearing
+     * is projected through the edge's (smoothed) relative rotation and carried
+     * alongside the *to* bearing, with the derivative of each with respect to
+     * its frame's focal scale. The derivatives are numerical — a central
+     * difference of the full bearing pipeline including the pivot referral,
+     * which has no closed form worth inlining — and each costs two re-projections
+     * of one pixel, so a few hundred correspondences come out in microseconds.
+     */
+    private fun buildFocalCorrespondences(
+        frames: List<DecodedFrame>,
+        features: List<FrameFeatures>,
+        edges: List<RotationMath.RotationEdge>,
+        edgeInliers: List<List<Pair<Int, Int>>>,
+        relativeRotations: List<DoubleArray>,
+        pivotRatio: Double,
+        scales: DoubleArray,
+    ): List<RotationMath.FocalCorrespondence> {
+        val correspondences = ArrayList<RotationMath.FocalCorrespondence>()
+        for (edgeIndex in edges.indices) {
+            val edge = edges[edgeIndex]
+            val fromFrame = frames[edge.from]
+            val toFrame = frames[edge.to]
+            val fromFeatures = features[edge.from]
+            val toFeatures = features[edge.to]
+            val relative = relativeRotations[edgeIndex]
+            for ((fromMatch, toMatch) in edgeInliers[edgeIndex]) {
+                val fromPixel = fromFeatures.idealPixels[fromMatch]
+                val toPixel = toFeatures.idealPixels[toMatch]
+                val pFrom = cameraBearing(
+                    fromFrame.intrinsics, fromFrame.sensorBasis, pivotRatio,
+                    fromPixel, scales[edge.from],
+                )
+                val pTo = cameraBearing(
+                    toFrame.intrinsics, toFrame.sensorBasis, pivotRatio,
+                    toPixel, scales[edge.to],
+                )
+                val dFrom = focalDerivative(
+                    fromFrame.intrinsics, fromFrame.sensorBasis, pivotRatio,
+                    fromPixel, scales[edge.from],
+                )
+                val dTo = focalDerivative(
+                    toFrame.intrinsics, toFrame.sensorBasis, pivotRatio,
+                    toPixel, scales[edge.to],
+                )
+                correspondences += RotationMath.FocalCorrespondence(
+                    from = edge.from,
+                    to = edge.to,
+                    transformedFrom = RotationMath.apply(relative, pFrom),
+                    toBearing = pTo,
+                    transformedFromDerivative = RotationMath.apply(relative, dFrom),
+                    toDerivative = dTo,
+                )
+            }
+        }
+        return correspondences
+    }
+
+    /**
+     * The unit bearing an ideal pixel records under a focal-length multiplier
+     * of [scale].
+     *
+     * A focal scale of 1 reproduces the bearing [extractFeatures] computes, so
+     * the two halves of the refinement measure the same geometry. Scaling the
+     * focal length moves the bearing radially about the optical axis — the
+     * pixel is divided through by the *corrected* focal length — and the pivot
+     * referral (when there is one) runs afterwards, exactly as for a freshly
+     * detected keypoint.
+     */
+    private fun cameraBearing(
+        intrinsics: FrameIntrinsics,
+        basis: CameraBasis,
+        pivotRatio: Double,
+        idealPixel: DoubleArray,
+        scale: Double,
+    ): DoubleArray {
+        var x = (idealPixel[0] - intrinsics.centerXPx) / (intrinsics.focalXPx * scale)
+        var y = -(idealPixel[1] - intrinsics.centerYPx) / (intrinsics.focalYPx * scale)
+        val length = Math.sqrt(x * x + y * y + 1.0)
+        x /= length
+        y /= length
+        val z = 1.0 / length
+        return if (pivotRatio > 0.0) {
+            pivotReferredBearing(basis, pivotRatio, x, y, z)
+        } else {
+            doubleArrayOf(x, y, z)
+        }
+    }
+
+    /**
+     * How a bearing at [idealPixel] moves when its frame's focal length is
+     * scaled by `e^δ`, evaluated at the current [scale].
+     *
+     * Central difference in log-scale space: the bearing is re-projected at
+     * `scale·e^±h` and the difference divided through. This is the derivative
+     * the focal solve needs, and doing it numerically means the pivot referral
+     * (a nonlinear map from the camera-frame bearing) is automatically included
+     * — no closed-form Jacobian to derive and get wrong.
+     */
+    private fun focalDerivative(
+        intrinsics: FrameIntrinsics,
+        basis: CameraBasis,
+        pivotRatio: Double,
+        idealPixel: DoubleArray,
+        scale: Double,
+    ): DoubleArray {
+        val step = 1e-4
+        val plus = cameraBearing(intrinsics, basis, pivotRatio, idealPixel, scale * Math.exp(step))
+        val minus = cameraBearing(intrinsics, basis, pivotRatio, idealPixel, scale * Math.exp(-step))
+        return doubleArrayOf(
+            (plus[0] - minus[0]) / (2.0 * step),
+            (plus[1] - minus[1]) / (2.0 * step),
+            (plus[2] - minus[2]) / (2.0 * step),
         )
     }
 

@@ -132,6 +132,32 @@ class LensModelTest {
     }
 
     @Test
+    fun `scaling the focal length re-normalises the radial coefficients`() {
+        // A focal correction of s means the frame really spans s× the focal
+        // length it was described with, so the pixel-space polynomial has to be
+        // re-derived against the new focal: each term divides by s^(2·order).
+        val scale = 1.2
+        val scaled = workingFrame.scaledBy(scale)
+        assertEquals(workingFrame.focalXPx * scale, scaled.focalXPx, 1e-9)
+        assertEquals(workingFrame.focalYPx * scale, scaled.focalYPx, 1e-9)
+
+        // Scaling is a lens change, so the scaled frame must be identical to
+        // re-deriving the same lens at the new focal length from the unitless
+        // coefficients — that is the whole point of carrying them through.
+        val scaledRadial = scaled.radial!!
+        val reDerived = lens.pixelCoefficientsFor(workingFrame.focalPx * scale)!!
+        assertEquals(reDerived[0], scaledRadial[0], 1e-15)
+        assertEquals(reDerived[1], scaledRadial[1], 1e-20)
+        assertEquals(reDerived[2], scaledRadial[2], 1e-25)
+    }
+
+    @Test
+    fun `a unit focal scale is the identity`() {
+        val same = workingFrame.scaledBy(1.0)
+        assertTrue("scaledBy(1.0) should hand back the same instance", same === workingFrame)
+    }
+
+    @Test
     fun `the two resolutions describe the same lens`() {
         // Two decodes of one capture: the same physical ray must land on the
         // same *fraction* of the frame however coarsely it was decoded, which is

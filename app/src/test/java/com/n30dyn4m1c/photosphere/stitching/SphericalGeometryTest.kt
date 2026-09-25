@@ -47,6 +47,29 @@ class SphericalGeometryTest {
     }
 
     @Test
+    fun `of prefers a measured basis over the angles when the pose carries one`() {
+        val measured = CameraBasis.of(
+            CameraPose(yawDegrees = 10f, pitchDegrees = 20f, rollDegrees = -15f)
+        )
+        val pose = CameraPose(
+            yawDegrees = 0f,
+            pitchDegrees = 0f,
+            rollDegrees = 0f,
+            matrix = measured.toRotationMatrix(),
+        )
+
+        // The matrix wins even though the angles describe a different pose:
+        // the measured basis is exact where a reconstruction from the angles
+        // is not (the zenith).
+        val basis = CameraBasis.of(pose)
+        assertEquals(
+            0.0,
+            RotationMath.angle(basis.toRotationMatrix(), measured.toRotationMatrix()),
+            1e-9,
+        )
+    }
+
+    @Test
     fun `the basis stays orthonormal and right-handed at every attitude`() {
         for (yaw in -180..170 step 30) {
             for (pitch in -80..80 step 20) {

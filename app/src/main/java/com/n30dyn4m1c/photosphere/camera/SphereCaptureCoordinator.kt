@@ -26,18 +26,23 @@ data class CaptureGuidance(
     val plan: SphereTargetPlan? = null,
     /** Index of the target the reticle is guiding toward. */
     val activeIndex: Int = 0,
+    /**
+     * Plan indices that already have a frame. Targets can be shot in any order
+     * (see [TargetSelection]), so progress is a set, not a position.
+     */
+    val captured: Set<Int> = emptySet(),
     /** True from the moment the shutter is authorised until its frame lands. */
     val isCapturing: Boolean = false,
 ) {
     val totalTargets: Int get() = plan?.size ?: 0
 
+    /** Targets covered so far. */
+    val capturedTargets: Int get() = plan?.capturedCount(captured) ?: 0
+
     /** True once every target in the plan has been shot. */
-    val isComplete: Boolean get() = totalTargets > 0 && activeIndex >= totalTargets
+    val isComplete: Boolean get() = totalTargets > 0 && capturedTargets >= totalTargets
 
-    /** Targets covered so far, never past the end of the plan. */
-    val capturedTargets: Int get() = activeIndex.coerceAtMost(totalTargets)
-
-    val completedRings: Int get() = plan?.completedRings(capturedTargets) ?: 0
+    val completedRings: Int get() = plan?.completedRings(captured) ?: 0
 
     val ringCount: Int get() = plan?.ringCount ?: 0
 }
@@ -141,6 +146,16 @@ class SphereCaptureCoordinator(
      * @param isStitching true while the frames are owned by a stitch, which
      *   holds the shutter: a frame landing halfway through would not be in the
      *   set being stitched and would be deleted with it.
+     * @param captured reads the plan indices the buffer already holds a frame
+     *   for — the buffer is the truth, and outlives this coordinator across a
+     *   configuration change. Read *under the lock*, so a sample that queued
+     *   behind an undo sees the buffer after the undo, not before it (a stale
+     *   set would still count the undone target as shot and steer the reticle
+     *   straight off it).
+     * @param canTrigger false while the session's exposure has not locked yet:
+     *   the reticle still guides and holds, but the shutter waits, because a
+     *   still fired mid-convergence is pinned to a half-converged (on a dark
+     *   scene, near-black) exposure.
      * @param createPlan lays out the plan around the bearing the user is
      *   already facing, called once on the first sample that carries a fix.
      */
@@ -148,6 +163,8 @@ class SphereCaptureCoordinator(
         orientation: OrientationData,
         nowMillis: Long,
         isStitching: Boolean,
+        captured: () -> Set<Int> = { emptySet() },
+        canTrigger: Boolean = true,
         createPlan: (startYawDegrees: Float) -> SphereTargetPlan,
     ): CaptureDecision = mutex.withLock {
         if (!orientation.hasFix) return@withLock CaptureDecision.Ignore
@@ -166,13 +183,29 @@ class SphereCaptureCoordinator(
             ?: createPlan(orientation.yawDegrees).also { created ->
                 _guidance.value = _guidance.value.copy(plan = created)
             }
+        val captured = captured()
+        if (captured != _guidance.value.captured) {
+            _guidance.value = _guidance.value.copy(captured = captured)
+        }
 
-        val target = plan.getOrNull(_guidance.value.activeIndex)
-        if (target == null) {
+        // Any marker can be shot: the active target follows the plan by
+        // default, and moves to whichever uncaptured dot the user aims
+        // squarely at.
+        val selected = TargetSelection.select(
+            plan, orientation, captured, _guidance.value.activeIndex,
+        )
+        if (selected == null) {
             // The sphere is walked; stop guiding until a new run starts.
             endDwell()
             return@withLock CaptureDecision.Guide(AlignmentState(), isHolding = false)
         }
+        if (selected != _guidance.value.activeIndex) {
+            // A new target starts a new dwell, and the samples aimed at the old
+            // one must not leak into the new one's pose mean.
+            endDwell()
+            _guidance.value = _guidance.value.copy(activeIndex = selected)
+        }
+        val target = plan[selected]
 
         val distance = SphereProjection.angularDistanceDegrees(orientation, target)
 
@@ -207,6 +240,11 @@ class SphereCaptureCoordinator(
         if (!reading.isTriggered) {
             return@withLock CaptureDecision.Guide(alignment, isHolding = reading.isAligned)
         }
+        if (!canTrigger) {
+            // The trigger is spent and the gate re-dwells; the window keeps
+            // rolling over the same held aim until the exposure lands.
+            return@withLock CaptureDecision.Guide(alignment, isHolding = true)
+        }
 
         val pose = meanOrientation(poseWindow.toList())
         poseWindow.clear()
@@ -222,22 +260,33 @@ class SphereCaptureCoordinator(
     }
 
     /**
-     * Reports that the frame authorised by [token] landed, advancing to the
-     * next target.
+     * Reports that the frame authorised by [token] landed, handing over to the
+     * next target (see [TargetSelection.afterCapture]).
      *
      * A token from a run that has since been reset or stepped back is ignored:
      * its frame belongs to a set that no longer exists, and advancing on it
      * would put the reticle past a target nothing was ever shot at.
      *
+     * @param captured the buffer's plan indices, now including this frame.
+     * @param orientation where the phone is pointing, to pick the nearest gap.
      * @return true when the run advanced.
      */
-    suspend fun onCaptured(token: CaptureToken): Boolean = mutex.withLock {
+    suspend fun onCaptured(
+        token: CaptureToken,
+        captured: Set<Int>,
+        orientation: OrientationData,
+    ): Boolean = mutex.withLock {
         if (!isCurrent(token)) return@withLock false
         isCapturing = false
         // Read the index back out rather than trusting the one handed to the
         // caller: the token has already established that it has not moved.
-        _guidance.value = _guidance.value.copy(
-            activeIndex = _guidance.value.activeIndex + 1,
+        val current = _guidance.value
+        val next = current.plan?.let { plan ->
+            TargetSelection.afterCapture(plan, orientation, captured, current.activeIndex)
+        }
+        _guidance.value = current.copy(
+            activeIndex = next ?: current.activeIndex,
+            captured = captured,
             isCapturing = false,
         )
         endDwell()
@@ -281,7 +330,10 @@ class SphereCaptureCoordinator(
         val index = dropLastFrame() ?: return@withLock false
         epoch++
         endDwell()
-        _guidance.value = _guidance.value.copy(activeIndex = index)
+        _guidance.value = _guidance.value.copy(
+            activeIndex = index,
+            captured = _guidance.value.captured - index,
+        )
         true
     }
 

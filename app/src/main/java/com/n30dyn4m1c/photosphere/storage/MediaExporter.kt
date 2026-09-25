@@ -144,7 +144,13 @@ object MediaExporter {
             ContentValues().apply { put(MediaStore.Images.Media.IS_PENDING, 0) },
             null,
             null,
-        )
+        ).takeIf { it > 0 } ?: run {
+            // The publish was refused or the row vanished under the copy; either
+            // way the user must not be told "Saved to gallery" for a row that
+            // stays pending and invisible. Drop the row and fail loudly.
+            runCatching { resolver.delete(uri, null, null) }
+            throw IOException("MediaStore would not publish $displayName")
+        }
 
         return ExportedPanorama(uri = uri, displayName = displayName)
     }
@@ -173,8 +179,15 @@ object MediaExporter {
         }
 
         val target = uniqueFile(album, displayName)
-        source.inputStream().use { bytes ->
-            target.outputStream().use { sink -> bytes.copyTo(sink) }
+        try {
+            source.inputStream().use { bytes ->
+                target.outputStream().use { sink -> bytes.copyTo(sink) }
+            }
+        } catch (e: Exception) {
+            // A copy that fails halfway leaves a partial JPEG in the user's
+            // public Pictures directory; delete it rather than leaving clutter.
+            target.delete()
+            throw e
         }
 
         val values = baseValues(target.name, width, height).apply {

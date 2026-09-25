@@ -21,17 +21,16 @@
 
     <!--
         Storage. On API 29+ the app writes through MediaStore and needs no
-        storage permission at all, so WRITE is capped at API 28 and READ is
-        capped at API 32 (it only covers reading spheres this app did not
-        create). Everything newer goes through MediaStore / the photo picker.
+        storage permission at all, so WRITE is capped at API 28 (the only
+        version that needs it). Nothing in the app ever reads the user's photo
+        library — frames and spheres live in the app's own cache until the user
+        exports them — so no READ permission is declared at all: not
+        READ_EXTERNAL_STORAGE and not READ_MEDIA_IMAGES, which also keeps the
+        Android 14+ selected-photos grant state from ever needing handling.
     -->
     <uses-permission
         android:name="android.permission.WRITE_EXTERNAL_STORAGE"
         android:maxSdkVersion="28" />
-    <uses-permission
-        android:name="android.permission.READ_EXTERNAL_STORAGE"
-        android:maxSdkVersion="32" />
-    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
 
     <uses-feature
         android:name="android.hardware.camera.any"
@@ -55,13 +54,25 @@
         android:theme="@style/Theme.PhotoSphere"
         tools:targetApi="31">
 
+        <!--
+            Portrait is a deliberate capture-screen decision (Google Camera does
+            the same): the HUD is a top/bottom arrangement and the capture
+            pipeline is tuned for it. From Android 16 the platform ignores fixed
+            orientation on large screens and in multi-window, so a tablet can be
+            force-rotated mid-session whether or not this is ready — the app
+            handles that rather than fighting it: the capture target rotation
+            follows the display, the optics re-read per configuration, and the
+            HUD lays out sideways when the screen is wider than it is tall. See
+            the orientation issue in the tracker. The lint flag is the
+            deliberate, reviewed choice to keep the lock for phones.
+        -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
             android:label="@string/app_name"
             android:screenOrientation="portrait"
             android:theme="@style/Theme.PhotoSphere"
-            tools:ignore="LockedOrientationActivity">
+            tools:ignore="LockedOrientationActivity,DiscouragedApi">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

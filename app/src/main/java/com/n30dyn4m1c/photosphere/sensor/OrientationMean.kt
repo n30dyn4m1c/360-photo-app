@@ -1,5 +1,7 @@
 package com.n30dyn4m1c.photosphere.sensor
 
+import com.n30dyn4m1c.photosphere.stitching.RotationMath
+
 /**
  * The mean of a run of orientation samples, for a steadier pose at the shutter.
  *
@@ -9,11 +11,38 @@ package com.n30dyn4m1c.photosphere.sensor
  * dwell's samples instead takes out the sample-to-sample sensor jitter, which is
  * exactly the noise that shows up as softness in the stitch overlaps. The mean
  * is equal-weight because the whole window is a single deliberate stop.
+ *
+ * When every sample carries its full camera basis ([OrientationData.cameraBasis]),
+ * the mean is taken over the **rotations** themselves — a quaternion mean — and
+ * the reported angles are re-derived from the result. Averaging the Euler
+ * components instead would smear a pose aimed near the zenith: there yaw and
+ * roll collapse into each other, each sample splits them differently, and the
+ * averaged components land the frame rotated about its own axis. Samples
+ * without a basis fall back to the component mean, which is exact away from
+ * the zenith.
  */
 internal fun meanOrientation(samples: List<OrientationData>): OrientationData {
     val valid = samples.filter { it.hasFix }
     val reference = valid.lastOrNull() ?: samples.lastOrNull() ?: OrientationData()
     if (valid.isEmpty()) return reference
+
+    // Every sample of the dwell carries the camera basis: average the
+    // rotations and re-derive the angles from the result, so the pose the
+    // stitcher reconstructs and the pose reported here agree exactly.
+    val bases = valid.mapNotNull { it.cameraBasis }
+    if (bases.size == valid.size) {
+        val basis = meanCameraBasis(bases)
+        val angles = anglesFromCameraBasis(basis, FloatArray(3))
+        return OrientationData(
+            yawDegrees = angles[0],
+            pitchDegrees = angles[1],
+            rollDegrees = angles[2],
+            accuracy = reference.accuracy,
+            timestampNanos = reference.timestampNanos,
+            cameraBasis = basis,
+        )
+    }
+
     return OrientationData(
         yawDegrees = normalizeDegrees(meanAngleDegrees(valid.map { it.yawDegrees })),
         pitchDegrees = meanAngleDegrees(valid.map { it.pitchDegrees }),
@@ -21,6 +50,22 @@ internal fun meanOrientation(samples: List<OrientationData>): OrientationData {
         accuracy = reference.accuracy,
         timestampNanos = reference.timestampNanos,
     )
+}
+
+/**
+ * The mean rotation of a dwell's camera bases, in the [cameraBasisMatrix]
+ * layout.
+ *
+ * The bases are close — the gate only fires on a deliberate stop — so the
+ * linear quaternion mean in [RotationMath.weightedMeanRotation] (signs aligned
+ * to the first sample, then a renormalised sum) is the Karcher mean to first
+ * order: exactly what a few degrees of sensor jitter need, and well-defined
+ * where the Euler components are not.
+ */
+private fun meanCameraBasis(bases: List<FloatArray>): FloatArray {
+    val matrices = bases.map { basis -> DoubleArray(9) { basis[it].toDouble() } }
+    val mean = RotationMath.weightedMeanRotation(matrices, List(matrices.size) { 1.0 })
+    return FloatArray(9) { mean[it].toFloat() }
 }
 
 /**

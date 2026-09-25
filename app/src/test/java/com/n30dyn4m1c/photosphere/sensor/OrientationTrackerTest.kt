@@ -4,6 +4,7 @@ import android.hardware.SensorManager
 import android.view.Surface
 import com.n30dyn4m1c.photosphere.stitching.CameraBasis
 import com.n30dyn4m1c.photosphere.stitching.CameraPose
+import com.n30dyn4m1c.photosphere.stitching.RotationMath
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -196,6 +197,37 @@ class OrientationTrackerTest {
         cameraAnglesDegrees(deviceMatrix(basis, Surface.ROTATION_0), Surface.ROTATION_0, out)
         assertTrue("yaw ${out[0]} should sit in [-180, 180)", out[0] in -180f..180f)
         assertTrue(out[0] != 180f || out[0] == -180f)
+    }
+
+    @Test
+    fun `the camera basis extracted from a device matrix round-trips`() {
+        // cameraBasisMatrix reads the same axes cameraAnglesDegrees reads, so
+        // feeding it the matrix a phone with a known basis would produce must
+        // hand that basis back unchanged — including the axes the display
+        // rotation remaps.
+        for (display in listOf(
+            Surface.ROTATION_0,
+            Surface.ROTATION_90,
+            Surface.ROTATION_180,
+            Surface.ROTATION_270,
+        )) {
+            val expected = CameraBasis.of(CameraPose(37f, -22f, 9f))
+            val extracted = FloatArray(9)
+            cameraBasisMatrix(deviceMatrix(expected, display), display, extracted)
+            val basis = CameraBasis.fromRotationMatrix(
+                doubleArrayOf(
+                    extracted[0].toDouble(), extracted[1].toDouble(), extracted[2].toDouble(),
+                    extracted[3].toDouble(), extracted[4].toDouble(), extracted[5].toDouble(),
+                    extracted[6].toDouble(), extracted[7].toDouble(), extracted[8].toDouble(),
+                )
+            )
+            assertEquals(
+                "display $display",
+                0.0,
+                RotationMath.angle(basis.toRotationMatrix(), expected.toRotationMatrix()),
+                1e-4,
+            )
+        }
     }
 
     private fun deviceMatrix(basis: CameraBasis, displayRotation: Int): FloatArray {

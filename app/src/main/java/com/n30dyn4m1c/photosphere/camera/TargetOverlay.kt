@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
@@ -26,6 +27,8 @@ import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import com.n30dyn4m1c.photosphere.sensor.OrientationData
+import com.n30dyn4m1c.photosphere.ui.theme.SphereAccent
+import com.n30dyn4m1c.photosphere.ui.theme.SphereActive
 import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.min
@@ -54,9 +57,9 @@ data class TargetOverlayColors(
     companion object {
         val Default = TargetOverlayColors(
             reticle = Color.White.copy(alpha = 0.9f),
-            reticleAligned = Color(0xFF3DDC84),
-            active = Color(0xFFFFC24B),
-            completed = Color(0xFF3DDC84),
+            reticleAligned = SphereAccent,
+            active = SphereActive,
+            completed = SphereAccent,
             pending = Color.White.copy(alpha = 0.32f),
             guide = Color.White.copy(alpha = 0.24f),
         )
@@ -81,6 +84,7 @@ fun TargetOverlay(
     alignment: () -> AlignmentState,
     plan: SphereTargetPlan?,
     activeIndex: Int,
+    captured: Set<Int>,
     fieldOfView: FieldOfView,
     modifier: Modifier = Modifier,
     colors: TargetOverlayColors = TargetOverlayColors.Default,
@@ -100,6 +104,22 @@ fun TargetOverlay(
         label = "target-pulse-phase",
     )
 
+    // A flash of white at the moment a shutter fires: the same cue a viewfinder
+    // gives, and the only feedback visible while the preview stalls. Decays in
+    // a fifth of a second — `isCapturing` itself stays true for the whole burst
+    // (a burst of three can take a couple of seconds), and a wash that long
+    // would read as a glitch and hide the aim. Observed through snapshotFlow so
+    // the sensor-rate alignment state does not recompose the overlay.
+    val flash = remember { Animatable(0f) }
+    LaunchedEffect(Unit) {
+        snapshotFlow { alignment().isCapturing }.collect { capturing ->
+            if (capturing) {
+                flash.snapTo(1f)
+                flash.animateTo(0f, animationSpec = tween(durationMillis = 200))
+            }
+        }
+    }
+
     Canvas(modifier = modifier.fillMaxSize()) {
         val currentOrientation = orientation()
         val currentAlignment = alignment()
@@ -109,6 +129,7 @@ fun TargetOverlay(
         drawTargets(
             targets = targets,
             activeIndex = activeIndex,
+            captured = captured,
             // The camera's axes are the same for every marker, so they are built
             // once here rather than rebuilt inside each projection: a full plan
             // is a few hundred markers and this runs at display rate.
@@ -121,10 +142,8 @@ fun TargetOverlay(
 
         drawReticle(alignment = currentAlignment, colors = colors)
 
-        if (currentAlignment.isCapturing) {
-            // A frame of white where the shutter fired: the same cue a viewfinder
-            // gives, and the only feedback visible while the preview stalls.
-            drawRect(color = Color.White.copy(alpha = 0.18f))
+        if (currentAlignment.isCapturing && flash.value > 0f) {
+            drawRect(color = Color.White.copy(alpha = 0.18f * flash.value))
         }
     }
 }
@@ -171,8 +190,8 @@ fun FocusReticleOverlay(
 
     Canvas(modifier = modifier.fillMaxSize()) {
         val color = when {
-            focus.isWorking -> Color(0xFFFFC24B)
-            focus.isLocked -> Color(0xFF3DDC84)
+            focus.isWorking -> SphereActive
+            focus.isLocked -> SphereAccent
             else -> Color.White.copy(alpha = 0.9f)
         }
 
@@ -253,6 +272,7 @@ private fun DrawScope.drawFocusCorners(
 private fun DrawScope.drawTargets(
     targets: List<SphereTarget>,
     activeIndex: Int,
+    captured: Set<Int>,
     camera: CameraFrame,
     focalPx: Float,
     colors: TargetOverlayColors,
@@ -264,13 +284,13 @@ private fun DrawScope.drawTargets(
     val margin = EDGE_MARGIN.toPx()
 
     targets.forEachIndexed { index, target ->
-        if (index == activeIndex) return@forEachIndexed
+        if (index == activeIndex && index !in captured) return@forEachIndexed
 
         val position = camera.project(target).screenOffset(center, focalPx)
             ?: return@forEachIndexed
         if (!position.isInside(size, margin)) return@forEachIndexed
 
-        val isShot = index < activeIndex
+        val isShot = index in captured
         drawTargetDot(
             position = position,
             color = if (isShot) colors.completed else colors.pending,
@@ -279,6 +299,9 @@ private fun DrawScope.drawTargets(
         )
     }
 
+    // A finished run has no live target: the last one hands over to nothing
+    // and stays drawn as covered.
+    if (activeIndex in captured) return
     val activeTarget = targets.getOrNull(activeIndex) ?: return
     drawActiveTarget(
         target = activeTarget,
@@ -534,6 +557,7 @@ private fun TargetOverlaySearchingPreview() {
         alignment = { AlignmentState(distanceDegrees = 15.4f) },
         plan = plan,
         activeIndex = 3,
+        captured = setOf(0, 1, 2),
         fieldOfView = FieldOfView(horizontalDegrees = 52f, verticalDegrees = 66f),
     )
 }
@@ -547,6 +571,7 @@ private fun TargetOverlayHoldingPreview() {
         alignment = { AlignmentState(distanceDegrees = 1.2f, dwellProgress = 0.6f, isAligned = true) },
         plan = plan,
         activeIndex = 3,
+        captured = setOf(0, 1, 2),
         fieldOfView = FieldOfView(horizontalDegrees = 52f, verticalDegrees = 66f),
     )
 }
